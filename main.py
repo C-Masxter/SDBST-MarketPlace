@@ -2783,6 +2783,37 @@ class AdButtons(discord.ui.View):
 # TICKET BUTTONS
 # ============================================================
 
+async def restrict_closed_ticket_channel(channel, guild, participant_ids):
+    """Make a closed ticket inaccessible to participants and non-admins."""
+    deny = discord.PermissionOverwrite(
+        view_channel=False,
+        send_messages=False,
+        read_message_history=False
+    )
+    # Apply @everyone first, but do not let one failed overwrite prevent the
+    # participant-specific denies below from being applied.
+    try:
+        await channel.set_permissions(guild.default_role, overwrite=deny)
+    except Exception as e:
+        print(f"[CLOSED DEFAULT PERMS] {e}")
+    for participant_id in participant_ids:
+        try:
+            member = guild.get_member(int(participant_id))
+        except (TypeError, ValueError):
+            member = None
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(participant_id))
+            except Exception as e:
+                print(f"[CLOSED MEMBER FETCH] {participant_id}: {e}")
+                continue
+        try:
+            # Explicit member deny overrides any role-based channel access.
+            await channel.set_permissions(member, overwrite=deny)
+        except Exception as e:
+            print(f"[CLOSED MEMBER PERMS] {member.id}: {e}")
+
+
 class TicketButtons(discord.ui.View):
 
     def __init__(self, ticket, mm_link=None):
@@ -2853,29 +2884,11 @@ class TicketButtons(discord.ui.View):
         except Exception as e:
             print(f"[CLOSE TICKET API] {e}")
         guild = interaction.guild
-        try:
-            deny = discord.PermissionOverwrite(
-                view_channel=False,
-                send_messages=False,
-                read_message_history=False
-            )
-            # Remove access from the ticket participants and every existing
-            # non-bot overwrite. Discord administrators retain access through
-            # the administrator permission bypass.
-            targets = list(getattr(interaction.channel, "overwrites", {}).keys())
-            for target in targets:
-                if target == guild.me or getattr(target, "id", None) == getattr(bot.user, "id", None):
-                    continue
-                await interaction.channel.set_permissions(target, overwrite=None)
-            for participant_id in (buyer_id, seller_id):
-                member = guild.get_member(participant_id)
-                if member is not None:
-                    # Remove the user-specific overwrite completely. With
-                    # @everyone denied below, only administrators can view.
-                    await interaction.channel.set_permissions(member, overwrite=None)
-            await interaction.channel.set_permissions(guild.default_role, overwrite=deny)
-        except Exception as e:
-            print(f"[CLOSE TICKET PERMS] {e}")
+        await restrict_closed_ticket_channel(
+            interaction.channel,
+            guild,
+            (buyer_id, seller_id)
+        )
         try:
             await interaction.message.edit(view=ClosedTicketView(self.ticket))
         except Exception as e:
@@ -3745,6 +3758,11 @@ async def restore_persistent_views():
                     continue
                 if ticket.get("status") == "closed":
                     _closed_ticket_channels.add(channel.id)
+                    await restrict_closed_ticket_channel(
+                        channel,
+                        guild,
+                        (ticket.get("buyer_id"), ticket.get("seller_id"))
+                    )
                     view_cls = ClosedTicketView
                 else:
                     view_cls = TicketButtons
