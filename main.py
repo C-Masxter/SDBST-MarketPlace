@@ -2888,9 +2888,20 @@ class TicketButtons(discord.ui.View):
 
             return
 
-        # Reuse the /mm command’s ticket-creation flow instead of sending
-        # the user to a channel and requiring a second manual command.
-        await mm.callback(interaction)
+        config = await get_server_config(interaction.guild.id)
+        mm_channel_id = config.get("mm_channel_id")
+        if not mm_channel_id:
+            await safe_error(interaction, "❌ MM channel hasn't been configured yet.")
+            return
+        try:
+            mm_channel = interaction.guild.get_channel(int(mm_channel_id))
+        except (TypeError, ValueError):
+            mm_channel = None
+        if not isinstance(mm_channel, discord.TextChannel):
+            await safe_error(interaction, "❌ The configured MM channel couldn't be found.")
+            return
+        mm_link = f"https://discord.com/channels/{interaction.guild.id}/{mm_channel.id}"
+        await interaction.response.send_message(mm_link, ephemeral=True)
 
 
 # ============================================================
@@ -4329,7 +4340,31 @@ class StockBuyButton(discord.ui.Button):
         if interaction.user.id == seller.id:
             await safe_error(interaction, "❌ You can't buy your own stock item.")
             return
-        result = await create_trade_ticket(guild, interaction.user, seller, post.get("name"), post.get("price"), f"stock-{self.post_id}")
+        # Tickets reference an existing backend ad. Stock posts are stored
+        # locally, so create the corresponding WTS ad record on first buy.
+        stock_ad_id = post.get("ad_id")
+        if not stock_ad_id:
+            try:
+                stock_ad = await api.create_ad({
+                    "server_id": str(guild.id),
+                    "owner_id": str(seller.id),
+                    "ad_type": "WTS",
+                    "item": str(post.get("name") or "Stock item"),
+                    "price": str(post.get("price") or "0"),
+                    "message_id": str(post.get("message_id") or interaction.message.id),
+                    "channel_id": str(post.get("channel_id") or interaction.channel.id),
+                })
+                stock_ad_id = stock_ad.get("ad_id") if isinstance(stock_ad, dict) else None
+                if not stock_ad_id:
+                    raise RuntimeError(f"Backend returned no ad_id: {stock_ad!r}")
+                post["ad_id"] = str(stock_ad_id)
+                _stock_posts[self.post_id] = post
+                save_stock_posts(_stock_posts)
+            except Exception as e:
+                print(f"[STOCK AD CREATE] {e}")
+                await safe_error(interaction, "❌ The stock item couldn't be registered with the backend. Please try again.")
+                return
+        result = await create_trade_ticket(guild, interaction.user, seller, post.get("name"), post.get("price"), stock_ad_id)
         if not result["ok"]:
             await safe_error(interaction, result["error"])
             return
