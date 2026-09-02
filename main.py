@@ -2845,12 +2845,24 @@ class TicketButtons(discord.ui.View):
             print(f"[CLOSE TICKET API] {e}")
         guild = interaction.guild
         try:
-            buyer = guild.get_member(buyer_id)
-            seller = guild.get_member(seller_id)
-            if buyer:
-                await interaction.channel.set_permissions(buyer, view_channel=False, send_messages=False, read_message_history=False)
-            if seller:
-                await interaction.channel.set_permissions(seller, view_channel=False, send_messages=False, read_message_history=False)
+            deny = discord.PermissionOverwrite(
+                view_channel=False,
+                send_messages=False,
+                read_message_history=False
+            )
+            # Remove access from the ticket participants and every existing
+            # non-bot overwrite. Discord administrators retain access through
+            # the administrator permission bypass.
+            targets = list(getattr(interaction.channel, "overwrites", {}).keys())
+            for target in targets:
+                if target == guild.me or getattr(target, "id", None) == getattr(bot.user, "id", None):
+                    continue
+                await interaction.channel.set_permissions(target, overwrite=deny)
+            for participant_id in (buyer_id, seller_id):
+                member = guild.get_member(participant_id)
+                if member is not None:
+                    await interaction.channel.set_permissions(member, overwrite=deny)
+            await interaction.channel.set_permissions(guild.default_role, overwrite=deny)
         except Exception as e:
             print(f"[CLOSE TICKET PERMS] {e}")
         try:
@@ -2901,7 +2913,18 @@ class TicketButtons(discord.ui.View):
             await safe_error(interaction, "❌ The configured MM channel couldn't be found.")
             return
         mm_link = f"https://discord.com/channels/{interaction.guild.id}/{mm_channel.id}"
-        await interaction.response.send_message(mm_link, ephemeral=True)
+        redirect_view = discord.ui.View(timeout=60)
+        redirect_view.add_item(discord.ui.Button(
+            label="Open MM Channel",
+            emoji="🤝",
+            style=discord.ButtonStyle.link,
+            url=mm_link
+        ))
+        await interaction.response.send_message(
+            "🤝 Click the button below to open the configured MM channel.",
+            view=redirect_view,
+            ephemeral=True
+        )
 
 
 # ============================================================
@@ -4053,6 +4076,7 @@ async def on_message(message):
     # ----------------------------------------------------
     if (
         not message.author.bot
+        and not message.author.guild_permissions.administrator
         and message.channel.id in _closed_ticket_channels
     ):
         try:
