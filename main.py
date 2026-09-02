@@ -666,10 +666,6 @@ def mm_deal_embed(deal):
 # AD TEXT (plain, searchable messages)
 # ============================================================
 
-NEGOTIATE_LINE = (
-    "💬 You can negotiate the deal privately "
-    "here in this ticket."
-)
 
 
 def ad_action_words(ad_type):
@@ -1508,13 +1504,13 @@ class MMCategorySelect(discord.ui.ChannelSelect):
 
 class ChannelBackButton(discord.ui.Button):
 
-    def __init__(self, parent):
+    def __init__(self, parent, row=2):
         self.parent_view = parent
         super().__init__(
             label="Back to Setup",
             emoji="⬅️",
             style=discord.ButtonStyle.primary,
-            row=2
+            row=row
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -1524,7 +1520,7 @@ class ChannelBackButton(discord.ui.Button):
 
 class MMAutoDetectToggle(discord.ui.Button):
 
-    def __init__(self, parent):
+    def __init__(self, parent, row=3):
         self.parent_view = parent
         on = str(
             (parent.config or {}).get("mm_autodetect", "true")
@@ -1546,9 +1542,8 @@ class MMAutoDetectToggle(discord.ui.Button):
                 if on
                 else discord.ButtonStyle.danger
             ),
-            row=3
+                        row=row
         )
-
     async def callback(self, interaction: discord.Interaction):
         if not interaction.user.guild_permissions.administrator:
             await safe_error(interaction, "❌ Administrator permissions required.")
@@ -1597,13 +1592,13 @@ class MMPrefixModal(discord.ui.Modal):
 
 class MMPrefixButton(discord.ui.Button):
 
-    def __init__(self, parent):
+    def __init__(self, parent, row=3):
         self.parent_view = parent
         super().__init__(
             label="MM Prefix",
             emoji="🏷️",
             style=discord.ButtonStyle.secondary,
-            row=3
+            row=row
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -1632,11 +1627,18 @@ class ChannelSettingsView(discord.ui.View):
             "stock_channel_id",
             "📦 Stock Post Channel (/stock post)",
             [discord.ChannelType.text],
-            row=4
+            row=2
         ))
-        self.add_item(ChannelBackButton(self))
-        self.add_item(MMAutoDetectToggle(self))
-        self.add_item(MMPrefixButton(self))
+        self.add_item(ConfigChannelSelect(
+            self,
+            "stock_buy_channel_id",
+            "🛒 Buy This Item Destination",
+            [discord.ChannelType.text],
+            row=3
+        ))
+        self.add_item(ChannelBackButton(self, row=4))
+        self.add_item(MMAutoDetectToggle(self, row=4))
+        self.add_item(MMPrefixButton(self, row=4))
 
     def build_embed(self):
         return channel_settings_embed(self.guild, self.config)
@@ -1851,6 +1853,13 @@ def setup_embed(guild, server_config):
         )
     )
 
+    stock_buy_ch = configured_channel(
+        guild,
+        server_config.get(
+            "stock_buy_channel_id"
+        )
+    )
+
     locked_ch = locked_channel_mentions(
         guild,
         server_config
@@ -1883,6 +1892,9 @@ def setup_embed(guild, server_config):
 
             f"📦 **Stock Post Channel:** "
             f"{stock_ch}\n"
+
+            f"🛒 **Buy This Item Destination:** "
+            f"{stock_buy_ch}\n"
 
             f"🔒 **Locked Channels:** "
             f"{locked_ch}\n"
@@ -2616,7 +2628,6 @@ class AdButtons(discord.ui.View):
                     f"**Seller:** "
                     f"{seller.mention}\n\n"
 
-                    f"{NEGOTIATE_LINE}"
                 ),
                 view=TicketButtons(
                     ticket_record,
@@ -4329,96 +4340,20 @@ async def create_trade_ticket(guild, buyer, seller, item, price, ad_id):
 # ============================================================
 
 class StockBuyButton(discord.ui.Button):
-    def __init__(self, post_id):
-        super().__init__(label="Buy This Item", emoji="🛒", style=discord.ButtonStyle.secondary, custom_id=f"stock:buy:{post_id}")
-        self.post_id = post_id
-
-    async def callback(self, interaction: discord.Interaction):
-        # Acknowledge immediately; ticket creation performs network/API work.
-        await interaction.response.defer(ephemeral=True)
-        post = _stock_posts.get(self.post_id)
-        if not post:
-            await safe_error(interaction, "❌ This stock item is no longer available.")
-            return
-        guild = interaction.guild
-        if guild is None:
-            await safe_error(interaction, "❌ This can only be used inside a server.")
-            return
-        try:
-            seller = await guild.fetch_member(int(post["poster_id"]))
-        except Exception as e:
-            print(f"[STOCK BUY SELLER] {e}")
-            await safe_error(interaction, "❌ Couldn't find the seller.")
-            return
-        if interaction.user.id == seller.id:
-            await safe_error(interaction, "❌ You can't buy your own stock item.")
-            return
-        # Tickets reference an existing backend ad. Stock posts are stored
-        # locally, so create the corresponding WTS ad record on first buy.
-        stock_ad_id = post.get("ad_id")
-        if not stock_ad_id:
-            try:
-                stock_ad = await api.create_ad({
-                    "server_id": str(guild.id),
-                    "owner_id": str(seller.id),
-                    "ad_type": "WTS",
-                    "item": str(post.get("name") or "Stock item"),
-                    "price": str(post.get("price") or "0"),
-                    "message_id": str(post.get("message_id") or interaction.message.id),
-                    "channel_id": str(post.get("channel_id") or interaction.channel.id),
-                })
-                stock_ad_id = stock_ad.get("ad_id") if isinstance(stock_ad, dict) else None
-                if not stock_ad_id:
-                    raise RuntimeError(f"Backend returned no ad_id: {stock_ad!r}")
-                post["ad_id"] = str(stock_ad_id)
-                _stock_posts[self.post_id] = post
-                save_stock_posts(_stock_posts)
-            except Exception as e:
-                print(f"[STOCK AD CREATE] {e}")
-                await safe_error(interaction, "❌ The stock item couldn't be registered with the backend. Please try again.")
-                return
-        result = await create_trade_ticket(guild, interaction.user, seller, post.get("name"), post.get("price"), stock_ad_id)
-        if not result["ok"]:
-            await safe_error(interaction, result["error"])
-            return
-        ticket_channel = result["channel"]
-        ticket_record = result["record"]
-        ticket_config = await get_server_config(guild.id)
-        ticket_message = None
-        try:
-            ticket_message = await ticket_channel.send(
-                content=(
-                    f"{seller.mention} {interaction.user.mention}\n\n"
-                    f"🎫 **Trade ticket opened**\n"
-                    f"**Item:** {post.get('name')}\n"
-                    f"**Price:** {money(post.get('price'))}\n"
-                    f"**Buyer:** {interaction.user.mention}\n"
-                    f"**Seller:** {seller.mention}\n\n"
-                    f"{NEGOTIATE_LINE}"
-                ),
-                view=TicketButtons(
-                    ticket_record,
-                    mm_link=(
-                        f"https://discord.com/channels/{guild.id}/{ticket_config.get('mm_channel_id')}"
-                        if ticket_config.get("mm_channel_id") else None
-                    )
-                )
-            )
-        except Exception as e:
-            print(f"[STOCK TICKET MSG] {e}")
-        if ticket_message is not None:
-            ticket_link = ticket_message.jump_url
-        else:
-            ticket_link = f"https://discord.com/channels/{guild.id}/{ticket_channel.id}"
-        await interaction.followup.send(
-            f"[Open your trade ticket ✔️]({ticket_link})\n💬 Negotiate the deal in the opened ticket.",
-            ephemeral=True
+    def __init__(self, post_id, buy_link):
+        super().__init__(
+            label="Buy This Item",
+            emoji="🛒",
+            style=discord.ButtonStyle.link,
+            url=buy_link,
+            row=0
         )
+        self.post_id = post_id
 
 
 class StockSoldButton(discord.ui.Button):
     def __init__(self, post_id):
-        super().__init__(label="Sold", emoji="✅", style=discord.ButtonStyle.danger, custom_id=f"stock:sold:{post_id}")
+        super().__init__(label="Sold", style=discord.ButtonStyle.danger, custom_id=f"stock:sold:{post_id}")
         self.post_id = post_id
 
     async def callback(self, interaction: discord.Interaction):
@@ -4435,10 +4370,10 @@ class StockSoldButton(discord.ui.Button):
 
 
 class StockPostButtons(discord.ui.View):
-    def __init__(self, post_id):
+    def __init__(self, post_id, buy_link):
         super().__init__(timeout=None)
         self.post_id = post_id
-        self.add_item(StockBuyButton(post_id))
+        self.add_item(StockBuyButton(post_id, buy_link))
         self.add_item(StockSoldButton(post_id))
 
 
@@ -4456,6 +4391,7 @@ class ReopenTicketButton(discord.ui.Button):
             await safe_error(interaction, "❌ Only staff can reopen tickets.")
             return
         guild = interaction.guild
+        await interaction.response.defer(ephemeral=True)
         _closed_ticket_channels.discard(interaction.channel.id)
         try:
             buyer_id = int(self.ticket["buyer_id"])
@@ -4464,12 +4400,20 @@ class ReopenTicketButton(discord.ui.Button):
             await safe_error(interaction, "❌ Invalid ticket data.")
             return
         try:
-            buyer = guild.get_member(buyer_id)
-            seller = guild.get_member(seller_id)
-            if buyer:
-                await interaction.channel.set_permissions(buyer, view_channel=True, send_messages=True, read_message_history=True)
-            if seller:
-                await interaction.channel.set_permissions(seller, view_channel=True, send_messages=True, read_message_history=True)
+            allow = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True
+            )
+            for participant_id in (buyer_id, seller_id):
+                member = guild.get_member(participant_id)
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(participant_id)
+                    except Exception as e:
+                        print(f"[REOPEN MEMBER FETCH] {participant_id}: {e}")
+                        continue
+                await interaction.channel.set_permissions(member, overwrite=allow)
         except Exception as e:
             print(f"[REOPEN PERMS] {e}")
         try:
@@ -4483,15 +4427,12 @@ class ReopenTicketButton(discord.ui.Button):
                 f"https://discord.com/channels/{guild.id}/{mm_channel_id}"
                 if mm_channel_id else None
             )
-            await interaction.response.edit_message(
+            await interaction.message.edit(
                 view=TicketButtons(self.ticket, mm_link=mm_link)
             )
+            await interaction.followup.send("🔓 Ticket reopened by staff.", ephemeral=True)
         except Exception as e:
             print(f"[REOPEN EDIT] {e}")
-        try:
-            await interaction.channel.send("🔓 Ticket reopened by staff.")
-        except Exception:
-            pass
 
 
 class DeleteTicketButton(discord.ui.Button):
@@ -4557,7 +4498,16 @@ async def restore_stock_views():
     count = 0
     for post_id, post in list(_stock_posts.items()):
         try:
-            bot.add_view(StockPostButtons(post_id), message_id=int(post["message_id"]))
+            guild = bot.get_guild(int(post["guild_id"]))
+            config = await get_server_config(guild.id) if guild else {}
+            buy_channel_id = config.get("stock_buy_channel_id")
+            buy_channel = guild.get_channel(int(buy_channel_id)) if guild and buy_channel_id else None
+            if not isinstance(buy_channel, discord.TextChannel):
+                buy_channel = guild.get_channel(int(post["channel_id"])) if guild else None
+            if not isinstance(buy_channel, discord.TextChannel):
+                raise RuntimeError("No valid Buy This Item destination channel")
+            buy_link = f"https://discord.com/channels/{guild.id}/{buy_channel.id}"
+            bot.add_view(StockPostButtons(post_id, buy_link), message_id=int(post["message_id"]))
             count += 1
         except Exception as e:
             print(f"[RESTORE STOCK] {e}")
@@ -4630,7 +4580,17 @@ class StockCog(commands.Cog):
         if img:
             embed.set_thumbnail(url=img)
         post_id = uuid.uuid4().hex[:8]
-        view = StockPostButtons(post_id)
+        buy_channel_id = config.get("stock_buy_channel_id")
+        buy_channel = None
+        if buy_channel_id:
+            try:
+                buy_channel = interaction.guild.get_channel(int(buy_channel_id))
+            except (TypeError, ValueError):
+                buy_channel = None
+        if not isinstance(buy_channel, discord.TextChannel):
+            buy_channel = stock_channel
+        buy_link = f"https://discord.com/channels/{interaction.guild.id}/{buy_channel.id}"
+        view = StockPostButtons(post_id, buy_link)
         try:
             msg = await stock_channel.send(embed=embed, view=view)
         except Exception as e:
@@ -4645,6 +4605,7 @@ class StockCog(commands.Cog):
             "name": name,
             "price": str(price_val),
             "image": img or None,
+            "buy_channel_id": str(buy_channel.id),
         }
         save_stock_posts(_stock_posts)
         await interaction.followup.send(f"✅ Stock item posted in {stock_channel.mention}.", ephemeral=True)
