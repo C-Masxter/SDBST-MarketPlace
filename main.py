@@ -2619,7 +2619,11 @@ class AdButtons(discord.ui.View):
                     f"{NEGOTIATE_LINE}"
                 ),
                 view=TicketButtons(
-                    ticket_record
+                    ticket_record,
+                    mm_link=(
+                        f"https://discord.com/channels/{guild.id}/{config.get('mm_channel_id')}"
+                        if config.get("mm_channel_id") else None
+                    )
                 )
             )
 
@@ -2781,13 +2785,18 @@ class AdButtons(discord.ui.View):
 
 class TicketButtons(discord.ui.View):
 
-    def __init__(self, ticket):
+    def __init__(self, ticket, mm_link=None):
 
-        super().__init__(
-            timeout=None
-        )
-
+        super().__init__(timeout=None)
         self.ticket = ticket
+        if mm_link:
+            self.add_item(discord.ui.Button(
+                label="Request MM",
+                emoji="🤝",
+                style=discord.ButtonStyle.link,
+                url=mm_link,
+                row=1
+            ))
 
 
     # ========================================================
@@ -2857,11 +2866,13 @@ class TicketButtons(discord.ui.View):
             for target in targets:
                 if target == guild.me or getattr(target, "id", None) == getattr(bot.user, "id", None):
                     continue
-                await interaction.channel.set_permissions(target, overwrite=deny)
+                await interaction.channel.set_permissions(target, overwrite=None)
             for participant_id in (buyer_id, seller_id):
                 member = guild.get_member(participant_id)
                 if member is not None:
-                    await interaction.channel.set_permissions(member, overwrite=deny)
+                    # Remove the user-specific overwrite completely. With
+                    # @everyone denied below, only administrators can view.
+                    await interaction.channel.set_permissions(member, overwrite=None)
             await interaction.channel.set_permissions(guild.default_role, overwrite=deny)
         except Exception as e:
             print(f"[CLOSE TICKET PERMS] {e}")
@@ -2875,56 +2886,7 @@ class TicketButtons(discord.ui.View):
             pass
 
 
-    # ========================================================
-    # REQUEST MM
-    # ========================================================
-
-    @discord.ui.button(
-        label="Request MM",
-        emoji="🤝",
-        style=discord.ButtonStyle.primary,
-        custom_id="ticket:mm"
-    )
-    async def request_mm(
-        self,
-        interaction,
-        button
-    ):
-
-        if interaction.guild is None:
-
-            await safe_error(
-                interaction,
-                "❌ This can only be used inside a server."
-            )
-
-            return
-
-        config = await get_server_config(interaction.guild.id)
-        mm_channel_id = config.get("mm_channel_id")
-        if not mm_channel_id:
-            await safe_error(interaction, "❌ MM channel hasn't been configured yet.")
-            return
-        try:
-            mm_channel = interaction.guild.get_channel(int(mm_channel_id))
-        except (TypeError, ValueError):
-            mm_channel = None
-        if not isinstance(mm_channel, discord.TextChannel):
-            await safe_error(interaction, "❌ The configured MM channel couldn't be found.")
-            return
-        mm_link = f"https://discord.com/channels/{interaction.guild.id}/{mm_channel.id}"
-        redirect_view = discord.ui.View(timeout=60)
-        redirect_view.add_item(discord.ui.Button(
-            label="Open MM Channel",
-            emoji="🤝",
-            style=discord.ButtonStyle.link,
-            url=mm_link
-        ))
-        await interaction.response.send_message(
-            "🤝 Click the button below to open the configured MM channel.",
-            view=redirect_view,
-            ephemeral=True
-        )
+    
 
 
 # ============================================================
@@ -3790,7 +3752,16 @@ async def restore_persistent_views():
                     async for message in channel.history(limit=20):
                         if message.author.id != bot.user.id:
                             continue
-                        bot.add_view(view_cls(ticket), message_id=message.id)
+                        view = view_cls(ticket)
+                        if view_cls is TicketButtons:
+                            cfg = await get_server_config(guild.id)
+                            mm_channel_id = cfg.get("mm_channel_id")
+                            mm_link = (
+                                f"https://discord.com/channels/{guild.id}/{mm_channel_id}"
+                                if mm_channel_id else None
+                            )
+                            view = TicketButtons(ticket, mm_link=mm_link)
+                        bot.add_view(view, message_id=message.id)
                         total_tickets += 1
                         break
                 except Exception as e:
@@ -4394,6 +4365,7 @@ class StockBuyButton(discord.ui.Button):
             return
         ticket_channel = result["channel"]
         ticket_record = result["record"]
+        ticket_config = await get_server_config(guild.id)
         ticket_message = None
         try:
             ticket_message = await ticket_channel.send(
@@ -4406,7 +4378,13 @@ class StockBuyButton(discord.ui.Button):
                     f"**Seller:** {seller.mention}\n\n"
                     f"{NEGOTIATE_LINE}"
                 ),
-                view=TicketButtons(ticket_record)
+                view=TicketButtons(
+                    ticket_record,
+                    mm_link=(
+                        f"https://discord.com/channels/{guild.id}/{ticket_config.get('mm_channel_id')}"
+                        if ticket_config.get("mm_channel_id") else None
+                    )
+                )
             )
         except Exception as e:
             print(f"[STOCK TICKET MSG] {e}")
@@ -4481,7 +4459,15 @@ class ReopenTicketButton(discord.ui.Button):
         except Exception as e:
             print(f"[REOPEN TICKET API] {e}")
         try:
-            await interaction.response.edit_message(view=TicketButtons(self.ticket))
+            config = await get_server_config(guild.id)
+            mm_channel_id = config.get("mm_channel_id")
+            mm_link = (
+                f"https://discord.com/channels/{guild.id}/{mm_channel_id}"
+                if mm_channel_id else None
+            )
+            await interaction.response.edit_message(
+                view=TicketButtons(self.ticket, mm_link=mm_link)
+            )
         except Exception as e:
             print(f"[REOPEN EDIT] {e}")
         try:
