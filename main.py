@@ -2943,7 +2943,7 @@ class AdModal(discord.ui.Modal):
         )
 
         self.price_input = discord.ui.TextInput(
-            label="Price (USD)",
+            label="Offers (USD)",
             placeholder="Example: 105.00",
             max_length=20,
             required=True
