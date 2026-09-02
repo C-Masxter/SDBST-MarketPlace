@@ -388,6 +388,10 @@ _bot_config = load_bot_config()
 # posting the deal flow).
 _pending_mm_channels = set()
 
+# Ticket channels closed by a participant. This is also enforced in
+# on_message as a safety net if Discord permission propagation fails.
+_closed_ticket_channels = set()
+
 
 def _find_ticket_opener(channel):
     """Find the ticket opener from channel overwrites.
@@ -2834,6 +2838,7 @@ class TicketButtons(discord.ui.View):
             return
 
         await interaction.response.send_message("🔒 Closing ticket...", ephemeral=True)
+        _closed_ticket_channels.add(interaction.channel.id)
         try:
             await api.close_ticket(self.ticket["ticket_id"])
         except Exception as e:
@@ -2883,62 +2888,9 @@ class TicketButtons(discord.ui.View):
 
             return
 
-        config = await get_server_config(
-            interaction.guild.id
-        )
-
-        mm_channel_id = config.get(
-            "mm_channel_id"
-        )
-
-        if not mm_channel_id:
-
-            await safe_error(
-                interaction,
-                (
-                    "❌ MM channel hasn't "
-                    "been configured yet."
-                )
-            )
-
-            return
-
-        try:
-
-            mm_channel = interaction.guild.get_channel(
-                int(mm_channel_id)
-            )
-
-        except (TypeError, ValueError):
-
-            mm_channel = None
-
-        if not mm_channel:
-
-            await safe_error(
-                interaction,
-                (
-                    "❌ The configured MM channel "
-                    "couldn't be found."
-                )
-            )
-
-            return
-
-        mm_link = (
-            f"https://discord.com/channels/"
-            f"{interaction.guild.id}/{mm_channel.id}"
-        )
-
-        await interaction.response.send_message(
-            (
-                f"🤝 **Middleman Request**\n"
-                f"[Click here to open a ticket "
-                f"and request MM]({mm_link}) "
-                f"({mm_channel.mention})"
-            ),
-            ephemeral=True
-        )
+        # Reuse the /mm command’s ticket-creation flow instead of sending
+        # the user to a channel and requiring a second manual command.
+        await mm.callback(interaction)
 
 
 # ============================================================
@@ -3796,6 +3748,7 @@ async def restore_persistent_views():
                 if channel is None:
                     continue
                 if ticket.get("status") == "closed":
+                    _closed_ticket_channels.add(channel.id)
                     view_cls = ClosedTicketView
                 else:
                     view_cls = TicketButtons
@@ -4083,6 +4036,21 @@ async def on_message(message):
     )
 
     # ----------------------------------------------------
+    # Closed ticket: users cannot view or send messages.
+    # The channel permission overwrite is applied on close;
+    # this deletion is a defensive fallback.
+    # ----------------------------------------------------
+    if (
+        not message.author.bot
+        and message.channel.id in _closed_ticket_channels
+    ):
+        try:
+            await message.delete()
+        except Exception as e:
+            print(f"[CLOSED TICKET DELETE] {e}")
+        return
+
+    # ----------------------------------------------------
     # Locked channel: auto-delete anything
     # that isn't the bot's own message.
     # ----------------------------------------------------
@@ -4342,6 +4310,8 @@ class StockBuyButton(discord.ui.Button):
         self.post_id = post_id
 
     async def callback(self, interaction: discord.Interaction):
+        # Acknowledge immediately; ticket creation performs network/API work.
+        await interaction.response.defer(ephemeral=True)
         post = _stock_posts.get(self.post_id)
         if not post:
             await safe_error(interaction, "❌ This stock item is no longer available.")
@@ -4385,8 +4355,8 @@ class StockBuyButton(discord.ui.Button):
             ticket_link = ticket_message.jump_url
         else:
             ticket_link = f"https://discord.com/channels/{guild.id}/{ticket_channel.id}"
-        await interaction.response.send_message(
-            f"[Click here to open a ticket ✔️]({ticket_link})\n💬 Negotiate the deal in the opened ticket.",
+        await interaction.followup.send(
+            f"[Open your trade ticket ✔️]({ticket_link})\n💬 Negotiate the deal in the opened ticket.",
             ephemeral=True
         )
 
@@ -4431,6 +4401,7 @@ class ReopenTicketButton(discord.ui.Button):
             await safe_error(interaction, "❌ Only staff can reopen tickets.")
             return
         guild = interaction.guild
+        _closed_ticket_channels.discard(interaction.channel.id)
         try:
             buyer_id = int(self.ticket["buyer_id"])
             seller_id = int(self.ticket["seller_id"])
@@ -4580,13 +4551,10 @@ class StockCog(commands.Cog):
         else:
             stock_channel = interaction.channel
         await interaction.response.defer(ephemeral=True)
-        img = image_url or None
+        # Use the supplied image as an embed thumbnail. Do not upload it as
+        # a separate Discord attachment, which creates a large second image.
+        img = image_url or (image.url if image else None)
         file_to_send = None
-        if not img and image:
-            try:
-                file_to_send = await image.to_file()
-            except Exception as e:
-                print(f"[STOCK IMAGE] {e}")
         if price_val == int(price_val):
             price_str = f"${int(price_val):,}"
         else:
@@ -4601,18 +4569,11 @@ class StockCog(commands.Cog):
         post_id = uuid.uuid4().hex[:8]
         view = StockPostButtons(post_id)
         try:
-            msg = await stock_channel.send(embed=embed, file=file_to_send, view=view)
+            msg = await stock_channel.send(embed=embed, view=view)
         except Exception as e:
             print(f"[STOCK POST] {e}")
             await interaction.followup.send("❌ Couldn't post the stock item.", ephemeral=True)
             return
-        if file_to_send and msg.attachments:
-            img = msg.attachments[0].url
-            embed.set_thumbnail(url=img)
-            try:
-                await msg.edit(embed=embed)
-            except Exception as e:
-                print(f"[STOCK THUMB] {e}")
         _stock_posts[post_id] = {
             "guild_id": str(interaction.guild.id),
             "channel_id": str(stock_channel.id),
