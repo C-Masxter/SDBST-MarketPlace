@@ -2730,14 +2730,16 @@ class AdButtons(discord.ui.View):
             )
 
         try:
-
-            await interaction.message.delete()
-
-        except Exception as e:
-
-            print(
-                f"[DELETE AD MESSAGE] {e}"
+            ad_type = str(self.ad.get("ad_type") or "WTS").upper()
+            verb = "BOUGHT" if ad_type == "WTB" else "SOLD"
+            item = str(self.ad.get("item") or "item")
+            await interaction.message.edit(
+                content=f"{interaction.user.mention} {verb} {item}",
+                embed=None,
+                view=None
             )
+        except Exception as e:
+            print(f"[COMPLETE AD MESSAGE] {e}")
 
 
     # ========================================================
