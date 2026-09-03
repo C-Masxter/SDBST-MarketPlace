@@ -2838,7 +2838,7 @@ class TicketButtons(discord.ui.View):
                 emoji="🤝",
                 style=discord.ButtonStyle.link,
                 url=mm_link,
-                row=1
+                row=0
             ))
 
 
