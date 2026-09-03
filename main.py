@@ -2297,6 +2297,9 @@ class AdButtons(discord.ui.View):
 
             return
 
+        # Acknowledge before any config, Discord, or backend network work.
+        await interaction.response.defer(ephemeral=True)
+
         try:
 
             owner_id = int(
@@ -2613,6 +2616,7 @@ class AdButtons(discord.ui.View):
                 content=(
                     f"{seller.mention} "
                     f"{interaction.user.mention}\n\n"
+                    f"💬 You can negotiate the deal privately here in this ticket.\n\n"
 
                     f"🎫 **Trade ticket opened**\n"
 
@@ -2655,13 +2659,8 @@ class AdButtons(discord.ui.View):
                 f"{guild.id}/{ticket_channel.id}"
             )
 
-        await interaction.response.send_message(
-            (
-                f"[Click here to open a ticket ✔️]"
-                f"({ticket_link})\n"
-                f"💬 Negotiate the deal in the "
-                f"opened ticket."
-            ),
+        await interaction.followup.send(
+            f"[Click here to open a ticket ✔️]({ticket_link})",
             ephemeral=True
         )
 
