@@ -391,6 +391,50 @@ _pending_mm_channels = set()
 # Ticket channels closed by a participant. This is also enforced in
 # on_message as a safety net if Discord permission propagation fails.
 _closed_ticket_channels = set()
+_negotiation_message_cache = {}
+
+
+def is_negotiation_channel(channel, config=None):
+    name = str(getattr(channel, "name", "") or "")
+    prefix = str((config or {}).get("mm_ticket_prefix") or "need-middleman-")
+    if name.startswith("ticket-") or name.startswith(prefix):
+        return True
+    channel_id = str(getattr(channel, "id", ""))
+    return any(
+        str(deal.get("ticket_channel_id")) == channel_id
+        for deal in _mm_deals.values()
+    )
+
+
+async def log_negotiation_event(message, config, event="MESSAGE"):
+    if message.guild is None or not is_negotiation_channel(message.channel, config):
+        return
+    log_channel_id = (config or {}).get("negotiation_log_channel_id")
+    try:
+        log_channel = message.guild.get_channel(int(log_channel_id)) if log_channel_id else None
+    except (TypeError, ValueError):
+        log_channel = None
+    if not isinstance(log_channel, discord.TextChannel) or log_channel.id == message.channel.id:
+        return
+    content = (getattr(message, "content", "") or "").strip() or "[no text]"
+    attachments = ""
+    if getattr(message, "attachments", None):
+        attachments = "\nAttachments: " + ", ".join(a.url for a in message.attachments)
+    embed = discord.Embed(
+        title=f"Negotiation {event}",
+        description=(
+            f"**Channel:** {message.channel.mention}\n"
+            f"**Author:** {message.author.mention}\n"
+            f"**Message ID:** `{message.id}`\n\n"
+            f"{content}{attachments}"
+        ),
+        color=discord.Color.blurple()
+    )
+    try:
+        await log_channel.send(embed=embed)
+    except Exception as e:
+        print(f"[NEGOTIATION LOG] {e}")
+
 
 
 def _find_ticket_opener(channel):
@@ -639,7 +683,7 @@ def mm_deal_embed(deal):
     price = deal.get("price") or "—"
     payment = deal.get("payment_method") or "—"
 
-    header = f"{item} | {money(price)} | {payment}"
+    header = f"{item} | {price} | {payment}"
 
     names = deal.get("names", {})
     confirmed = deal.get("confirmed", {})
@@ -659,7 +703,7 @@ def mm_deal_embed(deal):
         "accurate, please click 'Edit Deal'"
     )
 
-    return discord.Embed(description=description, color=discord.Color.blue())
+    return discord.Embed(description=description, color=discord.Color.from_rgb(110, 190, 255))
 
 
 # ============================================================
@@ -692,7 +736,7 @@ def format_ad_text(
     return (
         f"{mention} "
         f"{ad_action_words(ad_type)} "
-        f"**__{item}__** at **__{money(price)}__**"
+        f"**__{item}__** with offer **__{price}__**"
     )
 
 
@@ -1679,6 +1723,67 @@ class ChannelSettingsButton(discord.ui.Button):
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
 
+class NegotiationLogSettingsView(discord.ui.View):
+    def __init__(self, guild, config):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.config = dict(config or {})
+        self.add_item(ConfigChannelSelect(
+            self,
+            "negotiation_log_channel_id",
+            "📝 Negotiation Log Channel",
+            [discord.ChannelType.text],
+            row=0
+        ))
+        self.add_item(ChannelBackButton(self, row=4))
+
+    def build_embed(self):
+        channel = configured_channel(
+            self.guild,
+            self.config.get("negotiation_log_channel_id")
+        )
+        return discord.Embed(
+            title="📝 Negotiation Log Settings",
+            description=(
+                "Choose the channel where negotiation and deal activity "
+                f"will be logged.\n\n**Current channel:** {channel}"
+            ),
+            color=discord.Color.blurple()
+        )
+
+    async def save(self, interaction, key, value):
+        try:
+            await api.patch_config(interaction.guild.id, {key: str(value)})
+        except Exception as e:
+            print(f"[NEGOTIATION LOG SETUP] {e}")
+            await safe_error(interaction, "❌ Couldn't save the negotiation log channel.")
+            return
+        self.config[key] = str(value)
+        _bot_config.setdefault(str(interaction.guild.id), {})[key] = str(value)
+        invalidate_config_cache(interaction.guild.id)
+        refreshed = NegotiationLogSettingsView(self.guild, self.config)
+        await interaction.response.edit_message(embed=refreshed.build_embed(), view=refreshed)
+
+
+class NegotiationLogButton(discord.ui.Button):
+    def __init__(self, parent):
+        self.parent_view = parent
+        super().__init__(
+            label="Negotiation Log",
+            emoji="📝",
+            style=discord.ButtonStyle.secondary,
+            row=4
+        )
+
+    async def callback(self, interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await safe_error(interaction, "❌ Administrator permissions required.")
+            return
+        config = await get_server_config(interaction.guild.id)
+        view = NegotiationLogSettingsView(interaction.guild, config)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+
 class SetupView(discord.ui.View):
 
     def __init__(
@@ -1741,6 +1846,10 @@ class SetupView(discord.ui.View):
 
         self.add_item(
             ChannelSettingsButton(self)
+        )
+
+        self.add_item(
+            NegotiationLogButton(self)
         )
 
 
@@ -1859,6 +1968,10 @@ def setup_embed(guild, server_config):
             "stock_buy_channel_id"
         )
     )
+    negotiation_log_ch = configured_channel(
+        guild,
+        server_config.get("negotiation_log_channel_id")
+    )
 
     locked_ch = locked_channel_mentions(
         guild,
@@ -1895,6 +2008,8 @@ def setup_embed(guild, server_config):
 
             f"🛒 **Buy This Item Destination:** "
             f"{stock_buy_ch}\n"
+            f"📝 **Negotiation Log Channel:** "
+            f"{negotiation_log_ch}\n"
 
             f"🔒 **Locked Channels:** "
             f"{locked_ch}\n"
@@ -2146,7 +2261,7 @@ class EditAdModal(discord.ui.Modal):
         )
 
         self.price_input = discord.ui.TextInput(
-            label="Price (USD)",
+            label="Offer",
             default=str(
                 ad.get("price", "")
             ),
@@ -2168,27 +2283,15 @@ class EditAdModal(discord.ui.Modal):
         interaction: discord.Interaction
     ):
 
-        try:
-
-            price = float(
-                self.price_input.value
-            )
-
-            if price <= 0:
-                raise ValueError
-
-        except ValueError:
-
+        offer = self.price_input.value.strip()
+        if not offer:
             await interaction.response.send_message(
-                (
-                    "❌ Price must be a valid "
-                    "number greater than $0."
-                ),
+                "❌ Offer cannot be empty.",
                 ephemeral=True
             )
-
             return
 
+        price = offer
         item = self.item_input.value.strip()
 
         data = {
@@ -2224,14 +2327,16 @@ class EditAdModal(discord.ui.Modal):
                     )
 
                     await message.edit(
-                        content=create_ad_text_from_data(
-                            interaction.guild,
-                            updated_ad
+                        content=None,
+                        embed=discord.Embed(
+                            title=str(updated_ad.get("item") or "Item"),
+                            description=create_ad_text_from_data(
+                                interaction.guild,
+                                updated_ad
+                            ),
+                            color=discord.Color.from_rgb(115, 200, 255)
                         ),
-                        embed=None,
-                        view=AdButtons(
-                            updated_ad
-                        )
+                        view=AdButtons(updated_ad)
                     )
 
                 except discord.NotFound:
@@ -2733,8 +2838,12 @@ class AdButtons(discord.ui.View):
             verb = "BOUGHT" if ad_type == "WTB" else "SOLD"
             item = str(self.ad.get("item") or "item")
             await interaction.message.edit(
-                content=f"{interaction.user.mention} {verb} {item}",
-                embed=None,
+                content=None,
+                embed=discord.Embed(
+                    title=f"{item} ——SOLD",
+                    description=f"{interaction.user.mention} {verb} **__{item}__**",
+                    color=discord.Color.red()
+                ),
                 view=None
             )
         except Exception as e:
@@ -2944,7 +3053,7 @@ class AdModal(discord.ui.Modal):
         )
 
         self.price_input = discord.ui.TextInput(
-            label="Offers (USD)",
+            label="Offer",
             placeholder="Example: 105.00",
             max_length=20,
             required=True
@@ -2964,26 +3073,14 @@ class AdModal(discord.ui.Modal):
         interaction
     ):
 
-        try:
-
-            price = float(
-                self.price_input.value
-            )
-
-            if price <= 0:
-                raise ValueError
-
-        except ValueError:
-
+        offer = self.price_input.value.strip()
+        if not offer:
             await interaction.response.send_message(
-                (
-                    "❌ Enter a valid price "
-                    "greater than $0."
-                ),
+                "❌ Offer cannot be empty.",
                 ephemeral=True
             )
-
             return
+        price = offer
 
         await interaction.response.defer(
             ephemeral=True
@@ -3066,7 +3163,11 @@ class AdModal(discord.ui.Modal):
         try:
 
             message = await channel.send(
-                content=content
+                embed=discord.Embed(
+                    title=item,
+                    description=content,
+                    color=discord.Color.from_rgb(115, 200, 255)
+                )
             )
 
         except discord.Forbidden:
@@ -3331,7 +3432,7 @@ class EnterDealModal(discord.ui.Modal):
             default=str(existing.get("item", ""))
         )
         self.price_input = discord.ui.TextInput(
-            label="Price",
+            label="Offer",
             placeholder="Example: 50.00",
             max_length=20,
             required=True,
@@ -3349,13 +3450,11 @@ class EnterDealModal(discord.ui.Modal):
         self.add_item(self.payment_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        try:
-            price = float(self.price_input.value)
-            if price <= 0:
-                raise ValueError
-        except ValueError:
-            await interaction.response.send_message("❌ Price must be a valid number greater than $0.", ephemeral=True)
+        offer = self.price_input.value.strip()
+        if not offer:
+            await interaction.response.send_message("❌ Offer cannot be empty.", ephemeral=True)
             return
+        price = offer
         deal = _mm_deals.get(self.deal_id)
         if not deal:
             await interaction.response.send_message("❌ This ticket is no longer active.", ephemeral=True)
@@ -4069,6 +4168,9 @@ async def on_message(message):
     config = await cached_config_safe(
         message.guild.id
     )
+    if is_negotiation_channel(message.channel, config):
+        _negotiation_message_cache[message.id] = message
+        await log_negotiation_event(message, config, "MESSAGE")
 
     # ----------------------------------------------------
     # Closed ticket: users cannot view or send messages.
@@ -4179,6 +4281,27 @@ async def on_message(message):
         )
 
     await bot.process_commands(message)
+
+
+@bot.event
+async def on_message_edit(before, after):
+    if after.guild is None:
+        return
+    config = await cached_config_safe(after.guild.id)
+    if is_negotiation_channel(after.channel, config):
+        _negotiation_message_cache[after.id] = after
+        await log_negotiation_event(after, config, "EDITED")
+
+
+@bot.event
+async def on_raw_message_delete(payload):
+    message = _negotiation_message_cache.pop(payload.message_id, None)
+    if message is None or message.guild is None:
+        return
+    config = await cached_config_safe(message.guild.id)
+    if not is_negotiation_channel(message.channel, config):
+        return
+    await log_negotiation_event(message, config, "DELETED")
 
 
 # ============================================================
@@ -4472,9 +4595,10 @@ async def delete_duplicate_ads(guild, user_id, ad_type, item):
                 continue
             if str(ad.get("owner_id")) != str(user_id):
                 continue
-            if ad.get("ad_type") != ad_type:
+            if str(ad.get("ad_type", "")).upper() != str(ad_type).upper():
                 continue
-            if str(ad.get("item", "")).strip().lower() != item.lower():
+            normalize = lambda value: " ".join(str(value or "").casefold().split())
+            if normalize(ad.get("item")) != normalize(item):
                 continue
             try:
                 old_ch = guild.get_channel(int(ad.get("channel_id")))
