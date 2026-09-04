@@ -3690,6 +3690,86 @@ async def route_mm_for_deal(interaction, deal_id, tier):
     await interaction.followup.send("✅ Both users confirmed. The deal-range MM team has been invited and can now claim the ticket.", ephemeral=True)
 
 
+def tier_for_usd(value):
+    if value < 100:
+        return "below_100"
+    if value < 200:
+        return "100_200"
+    if value < 500:
+        return "200_500"
+    if value < 1000:
+        return "500_1000"
+    return "above_1000"
+
+
+class USDValueModal(discord.ui.Modal):
+    def __init__(self, deal_id):
+        super().__init__(title="Confirm USD Deal Value")
+        self.deal_id = deal_id
+        self.value_input = discord.ui.TextInput(
+            label="USD Value (integer only)",
+            placeholder="Example: 105",
+            max_length=12,
+            required=True
+        )
+        self.add_item(self.value_input)
+
+    async def on_submit(self, interaction):
+        raw = self.value_input.value.strip()
+        try:
+            value = int(raw)
+            if value < 0:
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message("❌ Enter a whole USD amount, such as `105`.", ephemeral=True)
+            return
+        deal = _mm_deals.get(self.deal_id)
+        if not deal:
+            await interaction.response.send_message("❌ This deal is no longer active.", ephemeral=True)
+            return
+        deal["price"] = str(value)
+        deal["usd_confirmed"] = {uid: False for uid in deal.get("participants", [])}
+        deal["state"] = "confirming_usd"
+        save_mm_deals(_mm_deals)
+        msg = await interaction.channel.send(embed=mm_deal_embed(deal), view=USDConfirmView(self.deal_id))
+        deal["usd_message_id"] = str(msg.id)
+        save_mm_deals(_mm_deals)
+        await interaction.response.send_message("✅ USD value posted. Both users must confirm it.", ephemeral=True)
+
+
+class USDConfirmButton(discord.ui.Button):
+    def __init__(self, deal_id, user_id, confirmed=False):
+        super().__init__(label="USD Confirmed" if confirmed else "Confirm USD", style=discord.ButtonStyle.primary if confirmed else discord.ButtonStyle.success, custom_id=f"mm:usdconfirm:{deal_id}:{user_id}")
+        self.deal_id = deal_id
+        self.user_id = user_id
+
+    async def callback(self, interaction):
+        deal = _mm_deals.get(self.deal_id)
+        if not deal or str(interaction.user.id) != self.user_id:
+            await safe_error(interaction, "❌ You cannot confirm this USD value.")
+            return
+        deal["usd_confirmed"][self.user_id] = not bool(deal["usd_confirmed"].get(self.user_id))
+        save_mm_deals(_mm_deals)
+        all_confirmed = all(deal["usd_confirmed"].get(uid) for uid in deal.get("participants", []))
+        if all_confirmed:
+            tier = tier_for_usd(int(deal["price"]))
+            try:
+                await interaction.response.edit_message(view=None)
+                await route_mm_for_deal(interaction, self.deal_id, tier)
+            except Exception as e:
+                print(f"[USD ROUTE] {e}")
+            return
+        await interaction.response.edit_message(view=USDConfirmView(self.deal_id))
+
+
+class USDConfirmView(discord.ui.View):
+    def __init__(self, deal_id):
+        super().__init__(timeout=None)
+        deal = _mm_deals.get(deal_id, {})
+        for uid in deal.get("participants", []):
+            self.add_item(USDConfirmButton(deal_id, uid, bool(deal.get("usd_confirmed", {}).get(uid))))
+
+
 class MMRoutingSelect(discord.ui.Select):
     def __init__(self, deal_id):
         options = [
@@ -3832,10 +3912,9 @@ class MMConfirmButton(discord.ui.Button):
         all_confirmed = all(deal["confirmed"].get(uid) for uid in deal.get("participants", []))
         if all_confirmed:
             try:
-                await interaction.response.edit_message(embed=embed, view=MMRoutingView(self.deal_id))
-                await interaction.followup.send("✅ Both users confirmed. Select the deal range to route the eligible MM team.", ephemeral=True)
+                await interaction.response.send_modal(USDValueModal(self.deal_id))
             except Exception as e:
-                print(f"[MM ROUTE PROMPT] {e}")
+                print(f"[USD MODAL] {e}")
             return
         try:
             await interaction.response.edit_message(embed=embed, view=view)
@@ -4069,6 +4148,12 @@ async def restore_mm_views():
                 count += 1
             except Exception as e:
                 print(f"[RESTORE MM DEAL] {e}")
+        if deal.get("usd_message_id") and deal.get("state") == "confirming_usd":
+            try:
+                bot.add_view(USDConfirmView(deal_id), message_id=int(deal["usd_message_id"]))
+                count += 1
+            except Exception as e:
+                print(f"[RESTORE MM USD] {e}")
     print(f"[RESTORE MM] Restored {count} MM view(s).")
 
 
