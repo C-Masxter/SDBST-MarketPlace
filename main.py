@@ -387,6 +387,7 @@ _bot_config = load_bot_config()
 # auto-detect handler knows to skip them (avoid double
 # posting the deal flow).
 _pending_mm_channels = set()
+_pending_mm_tiers = {}
 
 # Ticket channels closed by a participant. This is also enforced in
 # on_message as a safety net if Discord permission propagation fails.
@@ -955,6 +956,7 @@ class SDBSTBot(commands.Bot):
             self.views_restored = True
             await restore_persistent_views()
             await restore_mm_views()
+            await restore_mm_panel_views()
             await restore_stock_views()
             for channel_id, state in list(_ticket_inactivity.items()):
                 if state.get("prompted") and state.get("prompt_message_id"):
@@ -1690,6 +1692,102 @@ class MMPrefixButton(discord.ui.Button):
         )
 
 
+class MMValueTierSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="Deals Below $100", value="below_100", emoji="🟢", description="Click to create a ticket"),
+            discord.SelectOption(label="$100-$200 Deals", value="100_200", emoji="🔵", description="Click to create a ticket"),
+            discord.SelectOption(label="$200-$500 Deals", value="200_500", emoji="🟣", description="Click to create a ticket"),
+            discord.SelectOption(label="$500-$1000 Deals", value="500_1000", emoji="🔴", description="Click to create a ticket"),
+            discord.SelectOption(label="Deals above $1000", value="above_1000", emoji="⚫", description="Click to create a ticket"),
+        ]
+        super().__init__(placeholder="Select a deal range", options=options, custom_id="mm:panel:tier")
+
+    async def callback(self, interaction):
+        _pending_mm_tiers[interaction.id] = self.values[0]
+        await mm(interaction)
+
+
+class MMPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(MMValueTierSelect())
+
+
+async def ensure_mm_panel(guild, channel):
+    if not isinstance(channel, discord.TextChannel):
+        return None
+    config = await get_server_config(guild.id)
+    message_id = config.get("mm_panel_message_id") or _bot_config.get(str(guild.id), {}).get("mm_panel_message_id")
+    panel_embed = discord.Embed(
+        title="Request a Middleman",
+        description="Select the deal range below to request a middleman.",
+        color=discord.Color.red()
+    )
+    if message_id:
+        try:
+            message = await channel.fetch_message(int(message_id))
+            await message.edit(embed=panel_embed, view=MMPanelView())
+            return message
+        except Exception:
+            pass
+    message = await channel.send(embed=panel_embed, view=MMPanelView())
+    _bot_config.setdefault(str(guild.id), {})["mm_panel_message_id"] = str(message.id)
+    save_bot_config(_bot_config)
+    return message
+
+
+class MMPanelSettingsView(discord.ui.View):
+    def __init__(self, guild, config):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.config = dict(config or {})
+        self.add_item(ConfigChannelSelect(self, "mm_panel_channel_id", "🎫 Permanent MM Panel Channel", [discord.ChannelType.text], row=0))
+        self.add_item(ChannelBackButton(self, row=4))
+
+    def build_embed(self):
+        return discord.Embed(
+            title="🎫 MM Panel Settings",
+            description=(
+                "Select the channel where the permanent SDBST Request a Middleman panel will be posted.\n\n"
+                f"**Current channel:** {configured_channel(self.guild, self.config.get('mm_panel_channel_id'))}"
+            ),
+            color=discord.Color.blurple()
+        )
+
+    async def save(self, interaction, key, value):
+        try:
+            await api.patch_config(interaction.guild.id, {key: str(value)})
+            self.config[key] = str(value)
+            _bot_config.setdefault(str(interaction.guild.id), {})[key] = str(value)
+            save_bot_config(_bot_config)
+            channel = interaction.guild.get_channel(int(value))
+            if channel:
+                message = await ensure_mm_panel(interaction.guild, channel)
+                if message:
+                    await api.patch_config(interaction.guild.id, {"mm_panel_message_id": str(message.id)})
+        except Exception as e:
+            print(f"[MM PANEL SETUP] {e}")
+            await safe_error(interaction, "❌ Couldn't save or post the MM panel.")
+            return
+        refreshed = MMPanelSettingsView(self.guild, self.config)
+        await interaction.response.edit_message(embed=refreshed.build_embed(), view=refreshed)
+
+
+class MMPanelSettingsButton(discord.ui.Button):
+    def __init__(self, parent):
+        super().__init__(label="MM Panel", emoji="🎫", style=discord.ButtonStyle.secondary, row=4)
+        self.parent_view = parent
+
+    async def callback(self, interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await safe_error(interaction, "❌ Administrator permissions required.")
+            return
+        config = await get_server_config(interaction.guild.id)
+        view = MMPanelSettingsView(interaction.guild, config)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+
 class ChannelSettingsView(discord.ui.View):
     """
     Extra channel settings that don't fit on the main
@@ -1719,6 +1817,7 @@ class ChannelSettingsView(discord.ui.View):
         self.add_item(ChannelBackButton(self, row=4))
         self.add_item(MMAutoDetectToggle(self, row=4))
         self.add_item(MMPrefixButton(self, row=4))
+        self.add_item(MMPanelSettingsButton(self))
 
     def build_embed(self):
         return channel_settings_embed(self.guild, self.config)
@@ -2008,6 +2107,10 @@ def setup_embed(guild, server_config):
         guild,
         server_config.get("negotiation_log_channel_id")
     )
+    mm_panel_ch = configured_channel(
+        guild,
+        server_config.get("mm_panel_channel_id")
+    )
 
     locked_ch = locked_channel_mentions(
         guild,
@@ -2046,6 +2149,8 @@ def setup_embed(guild, server_config):
             f"{stock_buy_ch}\n"
             f"📝 **Negotiation Log Channel:** "
             f"{negotiation_log_ch}\n"
+            f"🎫 **Permanent MM Panel Channel:** "
+            f"{mm_panel_ch}\n"
 
             f"🔒 **Locked Channels:** "
             f"{locked_ch}\n"
@@ -3663,6 +3768,7 @@ class DealConfirmView(discord.ui.View):
     description="Request a middleman — opens an MM ticket."
 )
 async def mm(interaction: discord.Interaction):
+    mm_tier = _pending_mm_tiers.pop(interaction.id, None)
     if interaction.guild is None:
         await safe_error(interaction, "❌ This command must be used inside a server.")
         return
@@ -3748,7 +3854,8 @@ async def mm(interaction: discord.Interaction):
         "claim_message_id": str(claim_msg.id) if claim_msg else None,
         "select_message_id": str(select_msg.id) if select_msg else None,
         "deal_message_id": None,
-        "state": "awaiting_user"
+        "state": "awaiting_user",
+        "tier": mm_tier
     }
     save_mm_deals(_mm_deals)
     if claim_msg and select_msg:
@@ -3760,6 +3867,19 @@ async def mm(interaction: discord.Interaction):
 # ============================================================
 # RESTORE MM VIEWS
 # ============================================================
+
+async def restore_mm_panel_views():
+    for guild in bot.guilds:
+        try:
+            config = await get_server_config(guild.id)
+            channel_id = config.get("mm_panel_channel_id")
+            message_id = config.get("mm_panel_message_id") or _bot_config.get(str(guild.id), {}).get("mm_panel_message_id")
+            channel = guild.get_channel(int(channel_id)) if channel_id else None
+            if channel and message_id:
+                bot.add_view(MMPanelView(), message_id=int(message_id))
+        except Exception as e:
+            print(f"[RESTORE MM PANEL] {e}")
+
 
 async def restore_mm_views():
     count = 0
