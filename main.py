@@ -1675,6 +1675,23 @@ class MMPrefixButton(discord.ui.Button):
         )
 
 
+class RequestMMButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Request MM", emoji="🤝", style=discord.ButtonStyle.danger, custom_id="mm:panel:request")
+
+    async def callback(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        _pending_mm_tiers[interaction.id] = None
+        try:
+            await mm.callback(interaction)
+        except Exception as e:
+            print(f"[MM REQUEST] {e}")
+            try:
+                await interaction.followup.send("❌ I couldn't create that MM ticket. Check the bot console for the exact error.", ephemeral=True)
+            except Exception:
+                pass
+
+
 class MMValueTierSelect(discord.ui.Select):
     def __init__(self):
         options = [
@@ -1703,7 +1720,7 @@ class MMValueTierSelect(discord.ui.Select):
 class MMPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        self.add_item(MMValueTierSelect())
+        self.add_item(RequestMMButton())
 
 
 async def ensure_mm_panel(guild, channel):
@@ -1713,7 +1730,7 @@ async def ensure_mm_panel(guild, channel):
     message_id = config.get("mm_panel_message_id") or _bot_config.get(str(guild.id), {}).get("mm_panel_message_id")
     panel_embed = discord.Embed(
         title="Request a Middleman",
-        description="Select the deal range below to request a middleman.",
+        description="Click **Request MM** to open a private ticket.",
         color=discord.Color.red()
     )
     if message_id:
@@ -3567,7 +3584,7 @@ class MMClaimButton(discord.ui.Button):
             + f"\n\n🤝 **Claimed by {interaction.user.mention}**"
         )
         try:
-            await interaction.response.edit_message(embed=embed, view=None)
+            await interaction.response.edit_message(embed=embed, view=MMClaimView(self.deal_id))
         except Exception as e:
             print(f"[MM CLAIM EDIT] {e}")
         try:
@@ -3581,7 +3598,11 @@ class MMClaimView(discord.ui.View):
     def __init__(self, deal_id):
         super().__init__(timeout=None)
         self.deal_id = deal_id
-        self.add_item(MMClaimButton(deal_id))
+        claim_button = MMClaimButton(deal_id)
+        deal = _mm_deals.get(deal_id, {})
+        claim_button.disabled = bool(deal.get("claimed_by"))
+        self.add_item(claim_button)
+        self.add_item(MMCloseButton(deal_id))
 
 
 class MMUserSelect(discord.ui.UserSelect):
@@ -3638,6 +3659,64 @@ class MMSelectUserView(discord.ui.View):
         self.add_item(MMUserSelect(deal_id))
 
 
+async def route_mm_for_deal(interaction, deal_id, tier):
+    deal = _mm_deals.get(deal_id)
+    if not deal:
+        await interaction.followup.send("❌ This deal is no longer active.", ephemeral=True)
+        return
+    config = await get_server_config(interaction.guild.id)
+    deal["tier"] = tier
+    deal["state"] = "mm_available"
+    tier_key = f"mm_tier_members_{tier}"
+    invited = []
+    for raw_id in str(config.get(tier_key) or "").split(","):
+        try:
+            member = interaction.guild.get_member(int(raw_id.strip()))
+            if member and member.id not in {int(x) for x in deal.get("participants", []) if str(x).isdigit()}:
+                await interaction.channel.set_permissions(member, view_channel=True, send_messages=True, read_message_history=True)
+                invited.append(member)
+        except (TypeError, ValueError, discord.HTTPException):
+            continue
+    save_mm_deals(_mm_deals)
+    mentions = " ".join(member.mention for member in invited) or "the configured MM team"
+    claim_embed = discord.Embed(
+        title="Middleman Available",
+        description=f"Both users confirmed the deal and value. {mentions}, a middleman can claim this ticket.",
+        color=discord.Color.green()
+    )
+    claim_msg = await interaction.channel.send(embed=claim_embed, view=MMClaimView(deal_id))
+    deal["claim_message_id"] = str(claim_msg.id)
+    save_mm_deals(_mm_deals)
+    await interaction.followup.send("✅ Both users confirmed. The deal-range MM team has been invited and can now claim the ticket.", ephemeral=True)
+
+
+class MMRoutingSelect(discord.ui.Select):
+    def __init__(self, deal_id):
+        options = [
+            discord.SelectOption(label="Deals Below $100", value="below_100", emoji="🟢"),
+            discord.SelectOption(label="$100-$200 Deals", value="100_200", emoji="🔵"),
+            discord.SelectOption(label="$200-$500 Deals", value="200_500", emoji="🟣"),
+            discord.SelectOption(label="$500-$1000 Deals", value="500_1000", emoji="🔴"),
+            discord.SelectOption(label="Deals above $1000", value="above_1000", emoji="⚫"),
+        ]
+        super().__init__(placeholder="Select the deal range for MM routing", options=options, custom_id=f"mm:route:{deal_id}")
+        self.deal_id = deal_id
+
+    async def callback(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await route_mm_for_deal(interaction, self.deal_id, self.values[0])
+        except Exception as e:
+            print(f"[MM ROUTE] {e}")
+            await interaction.followup.send("❌ Couldn't route the MM team for this deal.", ephemeral=True)
+
+
+class MMRoutingView(discord.ui.View):
+    def __init__(self, deal_id):
+        super().__init__(timeout=None)
+        self.add_item(MMRoutingSelect(deal_id))
+
+
 class EnterDealModal(discord.ui.Modal):
 
     def __init__(self, deal_id, existing=None):
@@ -3682,6 +3761,7 @@ class EnterDealModal(discord.ui.Modal):
         deal["item"] = self.item_input.value.strip()
         deal["price"] = str(price)
         deal["payment_method"] = self.payment_input.value.strip()
+        deal["confirmed"] = {uid: False for uid in deal.get("participants", [])}
         deal["state"] = "confirming"
         save_mm_deals(_mm_deals)
         embed = mm_deal_embed(deal)
@@ -3745,14 +3825,18 @@ class MMConfirmButton(discord.ui.Button):
         if str(interaction.user.id) != self.user_id:
             await safe_error(interaction, "❌ This isn't your confirm button.")
             return
-        deal["confirmed"][self.user_id] = True
+        deal["confirmed"][self.user_id] = not bool(deal["confirmed"].get(self.user_id))
         save_mm_deals(_mm_deals)
         embed = mm_deal_embed(deal)
         view = DealConfirmView(self.deal_id)
         all_confirmed = all(deal["confirmed"].get(uid) for uid in deal.get("participants", []))
         if all_confirmed:
-            for child in view.children:
-                child.disabled = True
+            try:
+                await interaction.response.edit_message(embed=embed, view=MMRoutingView(self.deal_id))
+                await interaction.followup.send("✅ Both users confirmed. Select the deal range to route the eligible MM team.", ephemeral=True)
+            except Exception as e:
+                print(f"[MM ROUTE PROMPT] {e}")
+            return
         try:
             await interaction.response.edit_message(embed=embed, view=view)
         except Exception as e:
@@ -3781,8 +3865,8 @@ class MMEditDealButton(discord.ui.Button):
         if not deal:
             await safe_error(interaction, "❌ This deal is no longer active.")
             return
-        if str(interaction.user.id) != deal.get("creator_id"):
-            await safe_error(interaction, "❌ Only the deal creator can edit the deal.")
+        if str(interaction.user.id) not in {str(uid) for uid in deal.get("participants", [])}:
+            await safe_error(interaction, "❌ Only the deal participants can edit the deal.")
             return
         await interaction.response.send_modal(EnterDealModal(self.deal_id, existing=deal))
 
@@ -3902,23 +3986,7 @@ async def mm(interaction: discord.Interaction):
         await interaction.followup.send("❌ Discord failed to create the ticket.", ephemeral=True)
         return
     deal_id = uuid.uuid4().hex[:8]
-    claim_embed = discord.Embed(
-        title="Ticket Created",
-        description=(
-            f"{interaction.user.mention} "
-            f"{' '.join(member.mention for member in tier_members)}\n\n"
-            "Automatically state the user and deal in the ticket\n"
-            "To ensure ur safety\n"
-            "All activities within your MM tickets will be recorded including edited messages and deleted images"
-        ),
-        color=discord.Color.blue()
-    )
-    claim_embed.set_footer(text="SDBST Support | SDBST")
-    try:
-        claim_msg = await ticket_channel.send(embed=claim_embed, view=MMClaimView(deal_id))
-    except Exception as e:
-        print(f"[MM CLAIM MSG] {e}")
-        claim_msg = None
+    claim_msg = None
     select_embed = discord.Embed(
         description=(
             "**Who are you dealing with?**\n"
@@ -3950,10 +4018,10 @@ async def mm(interaction: discord.Interaction):
         "tier_member_ids": [str(member.id) for member in tier_members]
     }
     save_mm_deals(_mm_deals)
-    if claim_msg and select_msg:
-        await interaction.followup.send(f"🤝 Middleman ticket opened: {ticket_channel.mention}", ephemeral=True)
+    if select_msg:
+        await interaction.followup.send(f"🤝 MM ticket opened: {ticket_channel.mention}", ephemeral=True)
     else:
-        await interaction.followup.send("⚠️ Ticket created, but some setup messages failed to send.", ephemeral=True)
+        await interaction.followup.send("⚠️ Ticket created, but the participant selector failed to send.", ephemeral=True)
 
 
 # ============================================================
