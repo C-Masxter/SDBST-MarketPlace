@@ -696,7 +696,7 @@ def mm_deal_embed(deal):
 
     for uid in deal.get("participants", []):
         name = names.get(uid, f"<@{uid}>")
-        status = "Confirmed ✅" if confirmed.get(uid) else "Unconfirmed ❌"
+        status = "🟢 Confirmed" if confirmed.get(uid) else "🟡 Unconfirmed"
         lines.append(f"{name}: {status}")
 
     description = (
@@ -1477,7 +1477,7 @@ class StickyView(discord.ui.View):
 
             await safe_error(
                 interaction,
-                "✅ Sticky settings updated."
+                "🟢 Sticky settings updated."
             )
 
 
@@ -1928,7 +1928,7 @@ class ChannelSettingsView(discord.ui.View):
             await interaction.response.edit_message(embed=refreshed.build_embed(), view=refreshed)
         except Exception as e:
             print(f"[CHANNEL REFRESH] {e}")
-            await safe_error(interaction, "✅ Channel settings updated.")
+            await safe_error(interaction, "🟢 Channel settings updated.")
 
 
 class ChannelSettingsButton(discord.ui.Button):
@@ -2149,7 +2149,7 @@ class SetupView(discord.ui.View):
             await safe_error(
                 interaction,
                 (
-                    f"✅ **"
+                    f"🟢 **"
                     f"{key.replace('_', ' ').title()}"
                     f"** updated."
                 )
@@ -2581,7 +2581,7 @@ class EditAdModal(discord.ui.Modal):
                     pass
 
             await interaction.response.send_message(
-                "✅ Advertisement updated.",
+                "🟢 Advertisement updated.",
                 ephemeral=True
             )
 
@@ -3013,7 +3013,7 @@ class AdButtons(discord.ui.View):
 
     @discord.ui.button(
         label="Mark Done",
-        emoji="✅",
+        emoji="🟢",
         style=discord.ButtonStyle.secondary,
         custom_id="ad:done"
     )
@@ -3052,7 +3052,7 @@ class AdButtons(discord.ui.View):
 
         await interaction.response.send_message(
             (
-                "✅ Marking advertisement "
+                "🟢 Marking advertisement "
                 "as completed..."
             ),
             ephemeral=True
@@ -3508,7 +3508,7 @@ class AdModal(discord.ui.Modal):
 
         await interaction.followup.send(
             (
-                f"✅ Your **{self.ad_type}** ad "
+                f"🟢 Your **{self.ad_type}** ad "
                 f"was posted in {channel.mention}."
             ),
             ephemeral=True
@@ -3616,6 +3616,7 @@ class MMRoleButton(discord.ui.Button):
         if not deal or str(interaction.user.id) not in {str(uid) for uid in deal.get("participants", [])}:
             await safe_error(interaction, "❌ Only the deal participants can select a role.")
             return
+        await interaction.response.defer()
         deal.setdefault("roles", {})[str(interaction.user.id)] = self.role
         save_mm_deals(_mm_deals)
         roles = deal.get("roles", {})
@@ -3624,9 +3625,9 @@ class MMRoleButton(discord.ui.Button):
             deal["state"] = "confirming_roles"
             save_mm_deals(_mm_deals)
             embed = discord.Embed(title="Confirm Roles", description=role_summary(deal), color=discord.Color.blurple())
-            await interaction.response.edit_message(embed=embed, view=MMRoleConfirmView(self.deal_id))
+            await interaction.message.edit(embed=embed, view=MMRoleConfirmView(self.deal_id))
         else:
-            await interaction.response.edit_message(view=MMRoleView(self.deal_id))
+            await interaction.message.edit(view=MMRoleView(self.deal_id))
 
 
 class MMResetRoleButton(discord.ui.Button):
@@ -3639,24 +3640,25 @@ class MMResetRoleButton(discord.ui.Button):
         if not deal or str(interaction.user.id) not in {str(uid) for uid in deal.get("participants", [])}:
             await safe_error(interaction, "❌ Only the deal participants can reset roles.")
             return
+        await interaction.response.defer()
         deal["roles"] = {}
         deal["role_confirmed"] = {}
         deal["state"] = "selecting_roles"
         save_mm_deals(_mm_deals)
-        await interaction.response.edit_message(view=MMRoleView(self.deal_id))
+        await interaction.message.edit(view=MMRoleView(self.deal_id))
 
 
 class MMRoleView(discord.ui.View):
     def __init__(self, deal_id):
         super().__init__(timeout=None)
-        self.add_item(MMRoleButton(deal_id, "sender", "Sender", "💙"))
-        self.add_item(MMRoleButton(deal_id, "receiver", "Receiver", "💙"))
+        self.add_item(MMRoleButton(deal_id, "buyer", "Buyer", None))
+        self.add_item(MMRoleButton(deal_id, "seller", "Seller", None))
         self.add_item(MMResetRoleButton(deal_id))
 
 
 class MMRoleConfirmButton(discord.ui.Button):
     def __init__(self, deal_id, user_id, correct=True):
-        super().__init__(label="Correct" if correct else "Incorrect", emoji="✅" if correct else "❌", style=discord.ButtonStyle.success if correct else discord.ButtonStyle.danger, custom_id=f"mm:role_confirm:{deal_id}:{user_id}:{int(correct)}")
+        super().__init__(label="Correct" if correct else "Incorrect", emoji="🟢" if correct else "🔴", style=discord.ButtonStyle.success if correct else discord.ButtonStyle.danger, custom_id=f"mm:role_confirm:{deal_id}:{user_id}:{int(correct)}")
         self.deal_id = deal_id
         self.user_id = user_id
         self.correct = correct
@@ -3742,14 +3744,14 @@ class MMUserSelect(discord.ui.UserSelect):
         }
         deal["state"] = "selecting_roles"
         save_mm_deals(_mm_deals)
-        role_embed = discord.Embed(title="Select Your Role", description="**Sender:** deposits the funds.\n**Receiver:** receives the funds.\n\nChoose your role below.", color=discord.Color.blurple())
+        role_embed = discord.Embed(title="Select Your Role", description="**Buyer:** sends or pays for the deal.\n**Seller:** provides the item or receives the payment.\n\nChoose your role below.", color=discord.Color.blurple())
         try:
-            role_msg = await interaction.channel.send(content=f"✅ {selected.mention} has been added to the ticket.", embed=role_embed, view=MMRoleView(self.deal_id))
+            role_msg = await interaction.channel.send(content=f"🟢 {selected.mention} has been added to the ticket.", embed=role_embed, view=MMRoleView(self.deal_id))
             deal["role_message_id"] = str(role_msg.id)
             save_mm_deals(_mm_deals)
         except Exception:
             pass
-        await interaction.response.send_message("Choose Sender or Receiver in the ticket.", ephemeral=True)
+        await interaction.response.send_message("Choose Buyer or Seller in the ticket.", ephemeral=True)
 
 
 class MMSelectUserView(discord.ui.View):
@@ -3788,7 +3790,7 @@ async def route_mm_for_deal(interaction, deal_id, tier):
     claim_msg = await interaction.channel.send(embed=claim_embed, view=MMClaimView(deal_id))
     deal["claim_message_id"] = str(claim_msg.id)
     save_mm_deals(_mm_deals)
-    await interaction.followup.send("✅ Both users confirmed. The deal-range MM team has been invited and can now claim the ticket.", ephemeral=True)
+    await interaction.followup.send("🟢 Both users confirmed. The deal-range MM team has been invited and can now claim the ticket.", ephemeral=True)
 
 
 def tier_for_usd(value):
@@ -3835,7 +3837,7 @@ class USDValueModal(discord.ui.Modal):
         msg = await interaction.channel.send(embed=mm_deal_embed(deal), view=USDConfirmView(self.deal_id))
         deal["usd_message_id"] = str(msg.id)
         save_mm_deals(_mm_deals)
-        await interaction.response.send_message("✅ USD value posted. Both users must confirm it.", ephemeral=True)
+        await interaction.response.send_message("🟢 USD value posted. Both users must confirm it.", ephemeral=True)
 
 
 class PaymentMethodButton(discord.ui.Button):
@@ -3983,13 +3985,13 @@ class EnterDealModal(discord.ui.Modal):
                 await msg.edit(embed=embed, view=view)
             except Exception as e:
                 print(f"[MM EDIT CARD] {e}")
-            await interaction.response.send_message("✅ Deal updated.", ephemeral=True)
+            await interaction.response.send_message("🟢 Deal updated.", ephemeral=True)
         else:
             try:
                 msg = await interaction.channel.send(embed=embed, view=view)
                 deal["deal_message_id"] = str(msg.id)
                 save_mm_deals(_mm_deals)
-                await interaction.response.send_message("✅ Deal saved.", ephemeral=True)
+                await interaction.response.send_message("🟢 Deal saved.", ephemeral=True)
             except Exception as e:
                 print(f"[MM SEND CARD] {e}")
                 reason = str(e)
@@ -4000,14 +4002,14 @@ class EnterDealModal(discord.ui.Modal):
                         content=f"**{deal.get('item')} | {money(deal.get('price'))} | {deal.get('payment_method')}**\n"
                         + "\n".join(
                             f"{deal.get('names', {}).get(uid, f'<@{uid}>')}: "
-                            + ("Confirmed ✅" if deal.get("confirmed", {}).get(uid) else "Unconfirmed ❌")
+                            + ("🟢 Confirmed" if deal.get("confirmed", {}).get(uid) else "🟡 Unconfirmed")
                             for uid in deal.get("participants", [])
                         ),
                         view=view
                     )
                     deal["deal_message_id"] = str(msg.id)
                     save_mm_deals(_mm_deals)
-                    await safe_error(interaction, "✅ Deal saved (plain text).")
+                    await safe_error(interaction, "🟢 Deal saved (plain text).")
                 except Exception as e2:
                     print(f"[MM SEND CARD FALLBACK] {e2}")
                     await safe_error(
@@ -4053,7 +4055,7 @@ class MMConfirmButton(discord.ui.Button):
             print(f"[MM CONFIRM EDIT] {e}")
         if all_confirmed:
             try:
-                await interaction.followup.send("✅ All participants confirmed. A middleman may now proceed with this ticket.")
+                await interaction.followup.send("🟢 All participants confirmed. A middleman may now proceed with this ticket.")
             except Exception:
                 pass
 
@@ -4846,9 +4848,9 @@ class InactivityView(discord.ui.View):
         state.update({"last_activity": time.time(), "prompted": False})
         save_inactivity_state()
         try:
-            await interaction.response.edit_message(content="✅ Ticket kept open. A new 10-hour inactivity timer has started.", view=None)
+            await interaction.response.edit_message(content="🟢 Ticket kept open. A new 10-hour inactivity timer has started.", view=None)
         except Exception:
-            await safe_error(interaction, "✅ Ticket kept open. A new 10-hour inactivity timer has started.")
+            await safe_error(interaction, "🟢 Ticket kept open. A new 10-hour inactivity timer has started.")
 
     @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.danger, custom_id="ticket:inactive:close")
     async def close_ticket(self, interaction, button):
@@ -5104,7 +5106,7 @@ class StockSoldButton(discord.ui.Button):
         if not interaction.user.guild_permissions.administrator:
             await safe_error(interaction, "❌ Only staff can mark items as sold.")
             return
-        await interaction.response.send_message("✅ Marking as sold...", ephemeral=True)
+        await interaction.response.send_message("🟢 Marking as sold...", ephemeral=True)
         _stock_posts.pop(self.post_id, None)
         save_stock_posts(_stock_posts)
         try:
@@ -5353,7 +5355,7 @@ class StockCog(commands.Cog):
             "buy_channel_id": str(buy_channel.id),
         }
         save_stock_posts(_stock_posts)
-        await interaction.followup.send(f"✅ Stock item posted in {stock_channel.mention}.", ephemeral=True)
+        await interaction.followup.send(f"🟢 Stock item posted in {stock_channel.mention}.", ephemeral=True)
 
 
 # ============================================================
