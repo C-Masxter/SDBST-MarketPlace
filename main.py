@@ -1720,7 +1720,7 @@ class MMValueTierSelect(discord.ui.Select):
 class MMPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        self.add_item(RequestMMButton())
+        self.add_item(MMValueTierSelect())
 
 
 async def ensure_mm_panel(guild, channel):
@@ -1730,7 +1730,7 @@ async def ensure_mm_panel(guild, channel):
     message_id = config.get("mm_panel_message_id") or _bot_config.get(str(guild.id), {}).get("mm_panel_message_id")
     panel_embed = discord.Embed(
         title="Request a Middleman",
-        description="Click **Request MM** to open a private ticket.",
+        description="Select the deal range below to request a middleman.",
         color=discord.Color.red()
     )
     if message_id:
