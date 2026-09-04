@@ -1708,7 +1708,7 @@ class MMValueTierSelect(discord.ui.Select):
         tier = str(self.values[0]).strip()
         _pending_mm_tiers[interaction.id] = tier
         try:
-            await mm(interaction)
+            await mm.callback(interaction)
         except Exception as e:
             print(f"[MM TIER CREATE] tier={tier!r}: {e}")
             try:
