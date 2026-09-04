@@ -3619,6 +3619,7 @@ class MMRoleButton(discord.ui.Button):
         self.role = role
 
     async def callback(self, interaction):
+        print(f"[MM ROLE CLICK] custom_id={getattr(interaction, 'data', {}).get('custom_id')} message_id={getattr(getattr(interaction, 'message', None), 'id', None)} deal={self.deal_id} role={self.role} user={getattr(interaction.user, 'id', None)}")
         deal = _mm_deals.get(self.deal_id)
         if not deal:
             await safe_error(interaction, "❌ This ticket is no longer active.")
@@ -3674,9 +3675,20 @@ class MMResetRoleButton(discord.ui.Button):
 class MMRoleView(discord.ui.View):
     def __init__(self, deal_id):
         super().__init__(timeout=None)
+        self.deal_id = deal_id
         self.add_item(MMRoleButton(deal_id, "buyer", "Buyer", None))
         self.add_item(MMRoleButton(deal_id, "seller", "Seller", None))
         self.add_item(MMResetRoleButton(deal_id))
+
+    async def on_error(self, interaction, error, item):
+        print(f"[MM ROLE VIEW ERROR] deal={self.deal_id} item={item}: {error}")
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("❌ The role button failed. Check the bot console for [MM ROLE VIEW ERROR].", ephemeral=True)
+            else:
+                await interaction.response.send_message("❌ The role button failed. Check the bot console for [MM ROLE VIEW ERROR].", ephemeral=True)
+        except Exception:
+            pass
 
 
 class MMRoleConfirmButton(discord.ui.Button):
