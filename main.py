@@ -3616,7 +3616,6 @@ class MMRoleButton(discord.ui.Button):
         if not deal or str(interaction.user.id) not in {str(uid) for uid in deal.get("participants", [])}:
             await safe_error(interaction, "❌ Only the deal participants can select a role.")
             return
-        await interaction.response.defer()
         deal.setdefault("roles", {})[str(interaction.user.id)] = self.role
         save_mm_deals(_mm_deals)
         roles = deal.get("roles", {})
@@ -3625,9 +3624,9 @@ class MMRoleButton(discord.ui.Button):
             deal["state"] = "confirming_roles"
             save_mm_deals(_mm_deals)
             embed = discord.Embed(title="Confirm Roles", description=role_summary(deal), color=discord.Color.blurple())
-            await interaction.message.edit(embed=embed, view=MMRoleConfirmView(self.deal_id))
+            await interaction.response.edit_message(embed=embed, view=MMRoleConfirmView(self.deal_id))
         else:
-            await interaction.message.edit(view=MMRoleView(self.deal_id))
+            await interaction.response.edit_message(view=MMRoleView(self.deal_id))
 
 
 class MMResetRoleButton(discord.ui.Button):
@@ -3640,12 +3639,11 @@ class MMResetRoleButton(discord.ui.Button):
         if not deal or str(interaction.user.id) not in {str(uid) for uid in deal.get("participants", [])}:
             await safe_error(interaction, "❌ Only the deal participants can reset roles.")
             return
-        await interaction.response.defer()
         deal["roles"] = {}
         deal["role_confirmed"] = {}
         deal["state"] = "selecting_roles"
         save_mm_deals(_mm_deals)
-        await interaction.message.edit(view=MMRoleView(self.deal_id))
+        await interaction.response.edit_message(view=MMRoleView(self.deal_id))
 
 
 class MMRoleView(discord.ui.View):
