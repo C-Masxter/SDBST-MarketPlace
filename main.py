@@ -635,27 +635,10 @@ def is_locked_channel(channel, config):
     if channel.id in locked_channel_ids(config):
         return True
 
-    # Note: channels inside the MM Ticket Category are
-    # NOT auto-locked anymore — that deleted every
-    # message in every ticket (including Tickety's
-    # support- tickets), blocking chat. Only channels
-    # whose name starts with the MM prefix (created by
-    # /mm) are auto-locked so the deal UI stays clean.
-
-    # Middleman ticket channels (created by Tickety
-    # or /mm) are always locked so only the deal UI
-    # stays visible. The prefix is configurable in
-    # /setup.
-    name = getattr(channel, "name", "") or ""
-
-    prefix = str(
-        (config or {}).get("mm_ticket_prefix")
-        or "need-middleman-"
-    )
-
-    if name.startswith(prefix):
-        return True
-
+    # Active MM tickets must remain writable. Only channels
+    # explicitly selected in /setup as locked channels are
+    # auto-moderated here. Closed tickets are handled by the
+    # separate _closed_ticket_channels safety branch.
     return False
 
 
