@@ -1705,8 +1705,16 @@ class MMValueTierSelect(discord.ui.Select):
 
     async def callback(self, interaction):
         await interaction.response.defer(ephemeral=True)
-        _pending_mm_tiers[interaction.id] = self.values[0]
-        await mm(interaction)
+        tier = str(self.values[0]).strip()
+        _pending_mm_tiers[interaction.id] = tier
+        try:
+            await mm(interaction)
+        except Exception as e:
+            print(f"[MM TIER CREATE] tier={tier!r}: {e}")
+            try:
+                await interaction.followup.send("❌ I couldn't create that MM ticket. Check the bot console for the exact error.", ephemeral=True)
+            except Exception:
+                pass
 
 
 class MMPanelView(discord.ui.View):
