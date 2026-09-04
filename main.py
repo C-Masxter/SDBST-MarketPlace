@@ -1704,6 +1704,7 @@ class MMValueTierSelect(discord.ui.Select):
         super().__init__(placeholder="Select a deal range", options=options, custom_id="mm:panel:tier")
 
     async def callback(self, interaction):
+        await interaction.response.defer(ephemeral=True)
         _pending_mm_tiers[interaction.id] = self.values[0]
         await mm(interaction)
 
@@ -1772,6 +1773,89 @@ class MMPanelSettingsView(discord.ui.View):
             return
         refreshed = MMPanelSettingsView(self.guild, self.config)
         await interaction.response.edit_message(embed=refreshed.build_embed(), view=refreshed)
+
+
+class TierMemberSelect(discord.ui.UserSelect):
+    def __init__(self, parent, tier, label):
+        self.parent_view = parent
+        self.tier = tier
+        super().__init__(placeholder=label, min_values=0, max_values=10, row=parent.tier_rows[tier])
+
+    async def callback(self, interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await safe_error(interaction, "❌ Administrator permissions required.")
+            return
+        key = f"mm_tier_members_{self.tier}"
+        ids = ",".join(str(user.id) for user in self.values)
+        await self.parent_view.save(interaction, key, ids)
+
+
+class TierMembersView(discord.ui.View):
+    def __init__(self, guild, config):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.config = dict(config or {})
+        self.tier_rows = {
+            "below_100": 0,
+            "100_200": 1,
+            "200_500": 2,
+            "500_1000": 3,
+            "above_1000": 4,
+        }
+        labels = {
+            "below_100": "🟢 Below $100 members",
+            "100_200": "🔵 $100-$200 members",
+            "200_500": "🟣 $200-$500 members",
+            "500_1000": "🔴 $500-$1000 members",
+            "above_1000": "⚫ Above $1000 members",
+        }
+        for tier, label in labels.items():
+            self.add_item(TierMemberSelect(self, tier, label))
+
+    def build_embed(self):
+        lines = []
+        for tier, label in (
+            ("below_100", "🟢 Below $100"),
+            ("100_200", "🔵 $100-$200"),
+            ("200_500", "🟣 $200-$500"),
+            ("500_1000", "🔴 $500-$1000"),
+            ("above_1000", "⚫ Above $1000"),
+        ):
+            ids = str(self.config.get(f"mm_tier_members_{tier}") or "").strip()
+            mentions = " ".join(f"<@{x.strip()}>" for x in ids.split(",") if x.strip()) or "None"
+            lines.append(f"**{label}:** {mentions}")
+        return discord.Embed(
+            title="👥 MM Tier Members",
+            description="Select one or more people for each deal range. They will be invited and pinged when that range is selected.\n\n" + "\n".join(lines),
+            color=discord.Color.blurple()
+        )
+
+    async def save(self, interaction, key, value):
+        try:
+            await api.patch_config(interaction.guild.id, {key: value})
+        except Exception as e:
+            print(f"[TIER MEMBERS SETUP] {e}")
+            await safe_error(interaction, "❌ Couldn't save the tier members.")
+            return
+        self.config[key] = value
+        _bot_config.setdefault(str(interaction.guild.id), {})[key] = value
+        save_bot_config(_bot_config)
+        refreshed = TierMembersView(self.guild, self.config)
+        await interaction.response.edit_message(embed=refreshed.build_embed(), view=refreshed)
+
+
+class TierMembersButton(discord.ui.Button):
+    def __init__(self, parent):
+        self.parent_view = parent
+        super().__init__(label="Tier Members", emoji="👥", style=discord.ButtonStyle.secondary, row=4)
+
+    async def callback(self, interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await safe_error(interaction, "❌ Administrator permissions required.")
+            return
+        config = await get_server_config(interaction.guild.id)
+        view = TierMembersView(interaction.guild, config)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
 
 class MMPanelSettingsButton(discord.ui.Button):
@@ -1985,6 +2069,10 @@ class SetupView(discord.ui.View):
 
         self.add_item(
             NegotiationLogButton(self)
+        )
+
+        self.add_item(
+            TierMembersButton(self)
         )
 
 
@@ -3786,7 +3874,8 @@ async def mm(interaction: discord.Interaction):
     if not isinstance(category, discord.CategoryChannel):
         await safe_error(interaction, "❌ The configured ticket category doesn't exist.")
         return
-    await interaction.response.defer(ephemeral=True)
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
     ticket_num = random.randint(1000, 9999)
     channel_name = f"need-middleman-{ticket_num}"
     _pending_mm_channels.add(
@@ -3797,6 +3886,16 @@ async def mm(interaction: discord.Interaction):
         interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
         interaction.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True)
     }
+    tier_members = []
+    tier_key = f"mm_tier_members_{mm_tier}" if mm_tier else None
+    for raw_id in str(config.get(tier_key) or "").split(",") if tier_key else []:
+        try:
+            member = interaction.guild.get_member(int(raw_id.strip()))
+            if member and member.id != interaction.user.id:
+                overwrites[member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+                tier_members.append(member)
+        except (TypeError, ValueError):
+            continue
     try:
         ticket_channel = await interaction.guild.create_text_channel(
             name=channel_name,
@@ -3815,7 +3914,8 @@ async def mm(interaction: discord.Interaction):
     claim_embed = discord.Embed(
         title="Ticket Created",
         description=(
-            f"{interaction.user.mention}\n\n"
+            f"{interaction.user.mention} "
+            f"{' '.join(member.mention for member in tier_members)}\n\n"
             "Automatically state the user and deal in the ticket\n"
             "To ensure ur safety\n"
             "All activities within your MM tickets will be recorded including edited messages and deleted images"
@@ -3855,7 +3955,8 @@ async def mm(interaction: discord.Interaction):
         "select_message_id": str(select_msg.id) if select_msg else None,
         "deal_message_id": None,
         "state": "awaiting_user",
-        "tier": mm_tier
+        "tier": mm_tier,
+        "tier_member_ids": [str(member.id) for member in tier_members]
     }
     save_mm_deals(_mm_deals)
     if claim_msg and select_msg:
