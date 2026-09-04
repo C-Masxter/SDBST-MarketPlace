@@ -391,50 +391,6 @@ _pending_mm_channels = set()
 # Ticket channels closed by a participant. This is also enforced in
 # on_message as a safety net if Discord permission propagation fails.
 _closed_ticket_channels = set()
-_negotiation_message_cache = {}
-
-
-def is_negotiation_channel(channel, config=None):
-    name = str(getattr(channel, "name", "") or "")
-    prefix = str((config or {}).get("mm_ticket_prefix") or "need-middleman-")
-    if name.startswith("ticket-") or name.startswith(prefix):
-        return True
-    channel_id = str(getattr(channel, "id", ""))
-    return any(
-        str(deal.get("ticket_channel_id")) == channel_id
-        for deal in _mm_deals.values()
-    )
-
-
-async def log_negotiation_event(message, config, event="MESSAGE"):
-    if message.guild is None or not is_negotiation_channel(message.channel, config):
-        return
-    log_channel_id = (config or {}).get("negotiation_log_channel_id")
-    try:
-        log_channel = message.guild.get_channel(int(log_channel_id)) if log_channel_id else None
-    except (TypeError, ValueError):
-        log_channel = None
-    if not isinstance(log_channel, discord.TextChannel) or log_channel.id == message.channel.id:
-        return
-    content = (getattr(message, "content", "") or "").strip() or "[no text]"
-    attachments = ""
-    if getattr(message, "attachments", None):
-        attachments = "\nAttachments: " + ", ".join(a.url for a in message.attachments)
-    embed = discord.Embed(
-        title=f"Negotiation {event}",
-        description=(
-            f"**Channel:** {message.channel.mention}\n"
-            f"**Author:** {message.author.mention}\n"
-            f"**Message ID:** `{message.id}`\n\n"
-            f"{content}{attachments}"
-        ),
-        color=discord.Color.blurple()
-    )
-    try:
-        await log_channel.send(embed=embed)
-    except Exception as e:
-        print(f"[NEGOTIATION LOG] {e}")
-
 
 
 def _find_ticket_opener(channel):
@@ -683,7 +639,7 @@ def mm_deal_embed(deal):
     price = deal.get("price") or "—"
     payment = deal.get("payment_method") or "—"
 
-    header = f"{item} | {price} | {payment}"
+    header = f"{item} | {money(price)} | {payment}"
 
     names = deal.get("names", {})
     confirmed = deal.get("confirmed", {})
@@ -703,13 +659,17 @@ def mm_deal_embed(deal):
         "accurate, please click 'Edit Deal'"
     )
 
-    return discord.Embed(description=description, color=discord.Color.from_rgb(110, 190, 255))
+    return discord.Embed(description=description, color=discord.Color.blue())
 
 
 # ============================================================
 # AD TEXT (plain, searchable messages)
 # ============================================================
 
+NEGOTIATE_LINE = (
+    "💬 You can negotiate the deal privately "
+    "here in this ticket."
+)
 
 
 def ad_action_words(ad_type):
@@ -736,7 +696,7 @@ def format_ad_text(
     return (
         f"{mention} "
         f"{ad_action_words(ad_type)} "
-        f"**__{item}__** with offer **__{price}__**"
+        f"**__{item}__** at **__{money(price)}__**"
     )
 
 
@@ -1548,13 +1508,13 @@ class MMCategorySelect(discord.ui.ChannelSelect):
 
 class ChannelBackButton(discord.ui.Button):
 
-    def __init__(self, parent, row=2):
+    def __init__(self, parent):
         self.parent_view = parent
         super().__init__(
             label="Back to Setup",
             emoji="⬅️",
             style=discord.ButtonStyle.primary,
-            row=row
+            row=2
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -1564,7 +1524,7 @@ class ChannelBackButton(discord.ui.Button):
 
 class MMAutoDetectToggle(discord.ui.Button):
 
-    def __init__(self, parent, row=3):
+    def __init__(self, parent):
         self.parent_view = parent
         on = str(
             (parent.config or {}).get("mm_autodetect", "true")
@@ -1586,8 +1546,9 @@ class MMAutoDetectToggle(discord.ui.Button):
                 if on
                 else discord.ButtonStyle.danger
             ),
-                        row=row
+            row=3
         )
+
     async def callback(self, interaction: discord.Interaction):
         if not interaction.user.guild_permissions.administrator:
             await safe_error(interaction, "❌ Administrator permissions required.")
@@ -1636,13 +1597,13 @@ class MMPrefixModal(discord.ui.Modal):
 
 class MMPrefixButton(discord.ui.Button):
 
-    def __init__(self, parent, row=3):
+    def __init__(self, parent):
         self.parent_view = parent
         super().__init__(
             label="MM Prefix",
             emoji="🏷️",
             style=discord.ButtonStyle.secondary,
-            row=row
+            row=3
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -1671,18 +1632,11 @@ class ChannelSettingsView(discord.ui.View):
             "stock_channel_id",
             "📦 Stock Post Channel (/stock post)",
             [discord.ChannelType.text],
-            row=2
+            row=4
         ))
-        self.add_item(ConfigChannelSelect(
-            self,
-            "stock_buy_channel_id",
-            "🛒 Buy This Item Destination",
-            [discord.ChannelType.text],
-            row=3
-        ))
-        self.add_item(ChannelBackButton(self, row=4))
-        self.add_item(MMAutoDetectToggle(self, row=4))
-        self.add_item(MMPrefixButton(self, row=4))
+        self.add_item(ChannelBackButton(self))
+        self.add_item(MMAutoDetectToggle(self))
+        self.add_item(MMPrefixButton(self))
 
     def build_embed(self):
         return channel_settings_embed(self.guild, self.config)
@@ -1720,67 +1674,6 @@ class ChannelSettingsButton(discord.ui.Button):
             await safe_error(interaction, "❌ Administrator permissions required.")
             return
         view = ChannelSettingsView(self.parent_view.guild, self.parent_view.config)
-        await interaction.response.edit_message(embed=view.build_embed(), view=view)
-
-
-class NegotiationLogSettingsView(discord.ui.View):
-    def __init__(self, guild, config):
-        super().__init__(timeout=300)
-        self.guild = guild
-        self.config = dict(config or {})
-        self.add_item(ConfigChannelSelect(
-            self,
-            "negotiation_log_channel_id",
-            "📝 Negotiation Log Channel",
-            [discord.ChannelType.text],
-            row=0
-        ))
-        self.add_item(ChannelBackButton(self, row=4))
-
-    def build_embed(self):
-        channel = configured_channel(
-            self.guild,
-            self.config.get("negotiation_log_channel_id")
-        )
-        return discord.Embed(
-            title="📝 Negotiation Log Settings",
-            description=(
-                "Choose the channel where negotiation and deal activity "
-                f"will be logged.\n\n**Current channel:** {channel}"
-            ),
-            color=discord.Color.blurple()
-        )
-
-    async def save(self, interaction, key, value):
-        try:
-            await api.patch_config(interaction.guild.id, {key: str(value)})
-        except Exception as e:
-            print(f"[NEGOTIATION LOG SETUP] {e}")
-            await safe_error(interaction, "❌ Couldn't save the negotiation log channel.")
-            return
-        self.config[key] = str(value)
-        _bot_config.setdefault(str(interaction.guild.id), {})[key] = str(value)
-        invalidate_config_cache(interaction.guild.id)
-        refreshed = NegotiationLogSettingsView(self.guild, self.config)
-        await interaction.response.edit_message(embed=refreshed.build_embed(), view=refreshed)
-
-
-class NegotiationLogButton(discord.ui.Button):
-    def __init__(self, parent):
-        self.parent_view = parent
-        super().__init__(
-            label="Negotiation Log",
-            emoji="📝",
-            style=discord.ButtonStyle.secondary,
-            row=4
-        )
-
-    async def callback(self, interaction):
-        if not interaction.user.guild_permissions.administrator:
-            await safe_error(interaction, "❌ Administrator permissions required.")
-            return
-        config = await get_server_config(interaction.guild.id)
-        view = NegotiationLogSettingsView(interaction.guild, config)
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
 
@@ -1846,10 +1739,6 @@ class SetupView(discord.ui.View):
 
         self.add_item(
             ChannelSettingsButton(self)
-        )
-
-        self.add_item(
-            NegotiationLogButton(self)
         )
 
 
@@ -1962,17 +1851,6 @@ def setup_embed(guild, server_config):
         )
     )
 
-    stock_buy_ch = configured_channel(
-        guild,
-        server_config.get(
-            "stock_buy_channel_id"
-        )
-    )
-    negotiation_log_ch = configured_channel(
-        guild,
-        server_config.get("negotiation_log_channel_id")
-    )
-
     locked_ch = locked_channel_mentions(
         guild,
         server_config
@@ -2005,11 +1883,6 @@ def setup_embed(guild, server_config):
 
             f"📦 **Stock Post Channel:** "
             f"{stock_ch}\n"
-
-            f"🛒 **Buy This Item Destination:** "
-            f"{stock_buy_ch}\n"
-            f"📝 **Negotiation Log Channel:** "
-            f"{negotiation_log_ch}\n"
 
             f"🔒 **Locked Channels:** "
             f"{locked_ch}\n"
@@ -2261,7 +2134,7 @@ class EditAdModal(discord.ui.Modal):
         )
 
         self.price_input = discord.ui.TextInput(
-            label="Offer",
+            label="Price (USD)",
             default=str(
                 ad.get("price", "")
             ),
@@ -2283,15 +2156,27 @@ class EditAdModal(discord.ui.Modal):
         interaction: discord.Interaction
     ):
 
-        offer = self.price_input.value.strip()
-        if not offer:
+        try:
+
+            price = float(
+                self.price_input.value
+            )
+
+            if price <= 0:
+                raise ValueError
+
+        except ValueError:
+
             await interaction.response.send_message(
-                "❌ Offer cannot be empty.",
+                (
+                    "❌ Price must be a valid "
+                    "number greater than $0."
+                ),
                 ephemeral=True
             )
+
             return
 
-        price = offer
         item = self.item_input.value.strip()
 
         data = {
@@ -2327,16 +2212,14 @@ class EditAdModal(discord.ui.Modal):
                     )
 
                     await message.edit(
-                        content=None,
-                        embed=discord.Embed(
-                            title=str(updated_ad.get("item") or "Item"),
-                            description=create_ad_text_from_data(
-                                interaction.guild,
-                                updated_ad
-                            ),
-                            color=discord.Color.from_rgb(115, 200, 255)
+                        content=create_ad_text_from_data(
+                            interaction.guild,
+                            updated_ad
                         ),
-                        view=AdButtons(updated_ad)
+                        embed=None,
+                        view=AdButtons(
+                            updated_ad
+                        )
                     )
 
                 except discord.NotFound:
@@ -2401,9 +2284,6 @@ class AdButtons(discord.ui.View):
             )
 
             return
-
-        # Acknowledge before any config, Discord, or backend network work.
-        await interaction.response.defer(ephemeral=True)
 
         try:
 
@@ -2721,7 +2601,6 @@ class AdButtons(discord.ui.View):
                 content=(
                     f"{seller.mention} "
                     f"{interaction.user.mention}\n\n"
-                    f"💬 You can negotiate the deal privately here in this ticket.\n\n"
 
                     f"🎫 **Trade ticket opened**\n"
 
@@ -2737,6 +2616,7 @@ class AdButtons(discord.ui.View):
                     f"**Seller:** "
                     f"{seller.mention}\n\n"
 
+                    f"{NEGOTIATE_LINE}"
                 ),
                 view=TicketButtons(
                     ticket_record,
@@ -2764,8 +2644,13 @@ class AdButtons(discord.ui.View):
                 f"{guild.id}/{ticket_channel.id}"
             )
 
-        await interaction.followup.send(
-            f"[Click here to open a ticket ✔️]({ticket_link})",
+        await interaction.response.send_message(
+            (
+                f"[Click here to open a ticket ✔️]"
+                f"({ticket_link})\n"
+                f"💬 Negotiate the deal in the "
+                f"opened ticket."
+            ),
             ephemeral=True
         )
 
@@ -2834,20 +2719,14 @@ class AdButtons(discord.ui.View):
             )
 
         try:
-            ad_type = str(self.ad.get("ad_type") or "WTS").upper()
-            verb = "BOUGHT" if ad_type == "WTB" else "SOLD"
-            item = str(self.ad.get("item") or "item")
-            await interaction.message.edit(
-                content=None,
-                embed=discord.Embed(
-                    title=f"{item} ——SOLD",
-                    description=f"{interaction.user.mention} {verb} **__{item}__**",
-                    color=discord.Color.red()
-                ),
-                view=None
-            )
+
+            await interaction.message.delete()
+
         except Exception as e:
-            print(f"[COMPLETE AD MESSAGE] {e}")
+
+            print(
+                f"[DELETE AD MESSAGE] {e}"
+            )
 
 
     # ========================================================
@@ -2947,7 +2826,7 @@ class TicketButtons(discord.ui.View):
                 emoji="🤝",
                 style=discord.ButtonStyle.link,
                 url=mm_link,
-                row=0
+                row=1
             ))
 
 
@@ -3053,7 +2932,7 @@ class AdModal(discord.ui.Modal):
         )
 
         self.price_input = discord.ui.TextInput(
-            label="Offer",
+            label="Price (USD)",
             placeholder="Example: 105.00",
             max_length=20,
             required=True
@@ -3073,14 +2952,26 @@ class AdModal(discord.ui.Modal):
         interaction
     ):
 
-        offer = self.price_input.value.strip()
-        if not offer:
+        try:
+
+            price = float(
+                self.price_input.value
+            )
+
+            if price <= 0:
+                raise ValueError
+
+        except ValueError:
+
             await interaction.response.send_message(
-                "❌ Offer cannot be empty.",
+                (
+                    "❌ Enter a valid price "
+                    "greater than $0."
+                ),
                 ephemeral=True
             )
+
             return
-        price = offer
 
         await interaction.response.defer(
             ephemeral=True
@@ -3163,11 +3054,7 @@ class AdModal(discord.ui.Modal):
         try:
 
             message = await channel.send(
-                embed=discord.Embed(
-                    title=item,
-                    description=content,
-                    color=discord.Color.from_rgb(115, 200, 255)
-                )
+                content=content
             )
 
         except discord.Forbidden:
@@ -3313,447 +3200,523 @@ async def wts(
 
 
 # ============================================================
-# MIDDLEMAN (MM) FLOW
+# MIDDLEMAN (MM) FLOW — SDBST WORKFLOW
 # ============================================================
 
-class MMClaimButton(discord.ui.Button):
+MM_ROLE_KEYS = ("mm_trial_role_id", "mm_role_id", "mm_sr_role_id", "mm_head_role_id", "mm_admin_role_id", "mm_founder_role_id")
+MM_ROLE_LABELS = {"mm_trial_role_id": "Trial MM", "mm_role_id": "MM", "mm_sr_role_id": "SR MM", "mm_head_role_id": "Head MM", "mm_admin_role_id": "MM Admin", "mm_founder_role_id": "Founder MM"}
+MM_ROLE_THRESHOLDS = {"mm_trial_role_id": 0, "mm_role_id": 100, "mm_sr_role_id": 500, "mm_head_role_id": 2000, "mm_admin_role_id": 5000, "mm_founder_role_id": 10000}
 
+
+def mm_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def mm_deal_for_channel(channel_id):
+    for deal in _mm_deals.values():
+        if str(deal.get("ticket_channel_id")) == str(channel_id) and deal.get("status") != "deleted":
+            return deal
+    return None
+
+
+def mm_participant_ids(deal):
+    return [str(x) for x in deal.get("participants", [])]
+
+
+def mm_is_staff(member, config):
+    if member.guild_permissions.administrator or member.guild_permissions.manage_channels:
+        return True
+    staff_id = mm_int(config.get("staff_role_id"))
+    return staff_id and any(role.id == staff_id for role in getattr(member, "roles", []))
+
+
+async def mm_log(guild, deal, event, actor=None, details=""):
+    config = await get_server_config(guild.id)
+    channel = guild.get_channel(mm_int(config.get("log_channel_id")))
+    if not channel:
+        return
+    who = f" by {actor.mention} (`{actor.id}`)" if actor else ""
+    description = f"**{event}**{who}"
+    if details:
+        description += f"\n{details}"
+    description += f"\nTicket: <#{deal.get('ticket_channel_id')}> · Deal ID: `{deal.get('deal_id')}`"
+    try:
+        await channel.send(embed=discord.Embed(title="SDBST MM Log", description=description, color=discord.Color.dark_grey(), timestamp=datetime.now(timezone.utc)))
+    except Exception as exc:
+        print(f"[MM LOG] {exc}")
+
+
+def mm_eligible_keys(amount):
+    return [key for key, threshold in MM_ROLE_THRESHOLDS.items() if amount >= threshold]
+
+
+def mm_deal_embed(deal):
+    names = deal.get("names", {})
+    participants = deal.get("participants", [])
+    confirmed = deal.get("confirmed", {})
+    amount_confirmed = deal.get("amount_confirmed", {})
+    people = "\n".join(f"<@{uid}> — deal {'✅' if confirmed.get(uid) else '⏳'} · amount {'✅' if amount_confirmed.get(uid) else '⏳'}" for uid in participants) or "Waiting for participant."
+    eligible = ", ".join(MM_ROLE_LABELS.get(k, k) for k in deal.get("eligible_roles", [])) or "Not routed yet"
+    claimed = f"<@{deal['claimed_by']}>" if deal.get("claimed_by") else "Unclaimed"
+    embed = discord.Embed(title="SDBST Middleman Deal", color=discord.Color.blurple())
+    embed.add_field(name="Participants", value=people, inline=False)
+    embed.add_field(name="Deal", value=f"{deal.get('item') or 'Not entered'}\n{money(deal.get('price')) if deal.get('price') else 'USD value not entered'}\n{deal.get('payment_method') or 'Payment method not entered'}", inline=True)
+    embed.add_field(name="MM routing", value=eligible, inline=True)
+    embed.add_field(name="Claimed by", value=claimed, inline=True)
+    embed.set_footer(text=f"SDBST MM · {deal.get('deal_id', '')}")
+    return embed
+
+
+async def mm_save_and_refresh(interaction, deal, view=None):
+    deal["last_activity"] = time.time()
+    deal["inactivity_warning_at"] = None
+    save_mm_deals(_mm_deals)
+    if deal.get("deal_message_id"):
+        try:
+            msg = await interaction.channel.fetch_message(int(deal["deal_message_id"]))
+            await msg.edit(embed=mm_deal_embed(deal), view=view)
+        except Exception as exc:
+            print(f"[MM REFRESH] {exc}")
+
+
+async def mm_set_participant_permissions(channel, member):
+    await channel.set_permissions(member, view_channel=True, send_messages=True, read_message_history=True)
+
+
+async def mm_apply_routing_permissions(channel, deal):
+    config = await get_server_config(channel.guild.id)
+    for key in deal.get("eligible_roles", []):
+        role = channel.guild.get_role(mm_int(config.get(key)))
+        if role:
+            await channel.set_permissions(role, view_channel=True, send_messages=False, read_message_history=True)
+
+
+async def mm_apply_claim_permissions(channel, deal):
+    config = await get_server_config(channel.guild.id)
+    for key in deal.get("eligible_roles", []):
+        role = channel.guild.get_role(mm_int(config.get(key)))
+        if role:
+            await channel.set_permissions(role, view_channel=True, send_messages=False, read_message_history=True)
+    if deal.get("claimed_by"):
+        member = channel.guild.get_member(mm_int(deal["claimed_by"]))
+        if member:
+            await channel.set_permissions(member, view_channel=True, send_messages=True, read_message_history=True)
+
+
+async def mm_close_ticket(guild, channel, deal, actor, reason="closed"):
+    if deal.get("status") in ("closed", "deleted"):
+        return
+    deal["status"] = "closed"
+    deal["state"] = "closed"
+    deal["closed_at"] = time.time()
+    await mm_log(guild, deal, "Closed", actor, reason)
+    config = await get_server_config(guild.id)
+    overwrites = dict(channel.overwrites)
+    for uid in mm_participant_ids(deal):
+        member = guild.get_member(mm_int(uid))
+        if member:
+            overwrites[member] = discord.PermissionOverwrite(view_channel=False)
+    staff = guild.get_role(mm_int(config.get("staff_role_id")))
+    if staff:
+        overwrites[staff] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    try:
+        await channel.edit(overwrites=overwrites, reason=reason)
+        await channel.send("🔒 This ticket is closed. Staff can reopen or delete it.", view=MMStaffView(deal["deal_id"]))
+    except Exception as exc:
+        print(f"[MM CLOSE] {exc}")
+    save_mm_deals(_mm_deals)
+
+
+class MMClaimButton(discord.ui.Button):
     def __init__(self, deal_id):
-        super().__init__(
-            label="Claim",
-            emoji="🤝",
-            style=discord.ButtonStyle.success,
-            custom_id=f"mm:claim:{deal_id}"
-        )
+        super().__init__(label="Claim", emoji="🤝", style=discord.ButtonStyle.success, custom_id=f"mm:claim:{deal_id}")
         self.deal_id = deal_id
 
-    async def callback(self, interaction: discord.Interaction):
+    async def callback(self, interaction):
         deal = _mm_deals.get(self.deal_id)
-        if not deal:
-            await safe_error(interaction, "❌ This ticket is no longer active.")
-            return
+        if not deal or deal.get("state") != "routed":
+            return await safe_error(interaction, "❌ This ticket is not ready for MM claiming.")
+        config = await get_server_config(interaction.guild.id)
+        eligible_ids = [mm_int(config.get(key)) for key in deal.get("eligible_roles", [])]
+        if not any(role.id in eligible_ids for role in getattr(interaction.user, "roles", [])):
+            return await safe_error(interaction, "❌ You do not have an eligible MM role for this deal value.")
         if deal.get("claimed_by"):
-            await safe_error(interaction, "❌ This ticket has already been claimed.")
-            return
+            return await safe_error(interaction, "❌ This ticket is already claimed.")
         deal["claimed_by"] = str(interaction.user.id)
-        save_mm_deals(_mm_deals)
-        embed = (
-            interaction.message.embeds[0]
-            if interaction.message.embeds
-            else discord.Embed(title="Ticket Created")
-        )
-        embed.description = (
-            (embed.description or "")
-            + f"\n\n🤝 **Claimed by {interaction.user.mention}**"
-        )
-        try:
-            await interaction.response.edit_message(embed=embed, view=None)
-        except Exception as e:
-            print(f"[MM CLAIM EDIT] {e}")
-        try:
-            await interaction.channel.send(f"🤝 {interaction.user.mention} claimed this ticket.")
-        except Exception:
-            pass
+        deal["state"] = "in_progress"
+        await mm_apply_claim_permissions(interaction.channel, deal)
+        await mm_log(interaction.guild, deal, "Claimed", interaction.user)
+        await mm_save_and_refresh(interaction, deal, MMClaimView(self.deal_id))
+        await interaction.response.send_message(f"✅ {interaction.user.mention} claimed this ticket and can now speak.")
+
+
+class MMUnclaimButton(discord.ui.Button):
+    def __init__(self, deal_id):
+        super().__init__(label="Unclaim", style=discord.ButtonStyle.secondary, custom_id=f"mm:unclaim:{deal_id}")
+        self.deal_id = deal_id
+
+    async def callback(self, interaction):
+        deal = _mm_deals.get(self.deal_id)
+        if not deal or deal.get("claimed_by") != str(interaction.user.id):
+            return await safe_error(interaction, "❌ Only the claiming MM can unclaim this ticket.")
+        deal["claimed_by"] = None
+        deal["state"] = "routed"
+        await mm_apply_claim_permissions(interaction.channel, deal)
+        await mm_log(interaction.guild, deal, "Unclaimed", interaction.user)
+        await mm_save_and_refresh(interaction, deal, MMClaimView(self.deal_id))
+        await interaction.response.send_message("↩️ Ticket unclaimed. Another eligible MM may claim it.")
+
+
+class MMCompleteButton(discord.ui.Button):
+    def __init__(self, deal_id):
+        super().__init__(label="Complete Deal", style=discord.ButtonStyle.primary, custom_id=f"mm:complete:{deal_id}")
+        self.deal_id = deal_id
+
+    async def callback(self, interaction):
+        deal = _mm_deals.get(self.deal_id)
+        if not deal or deal.get("claimed_by") != str(interaction.user.id) or deal.get("state") != "in_progress":
+            return await safe_error(interaction, "❌ Only the claiming MM can complete an active deal.")
+        deal["state"] = "completed"
+        deal["status"] = "completed"
+        count_key = f"{deal.get('guild_id')}:{interaction.user.id}"
+        mm_counts = load_mm_counts()
+        mm_counts[count_key] = int(mm_counts.get(count_key, 0)) + 1
+        save_mm_counts(mm_counts)
+        await mm_log(interaction.guild, deal, "Completed", interaction.user, f"MM ticket count: **{mm_counts[count_key]}**")
+        config = await get_server_config(interaction.guild.id)
+        vouch = interaction.guild.get_channel(mm_int(config.get("vouches_channel_id")))
+        vouch_link = f"https://discord.com/channels/{interaction.guild.id}/{vouch.id}" if vouch else None
+        button = discord.ui.View(timeout=None)
+        if vouch_link:
+            button.add_item(discord.ui.Button(label="Vouch here", style=discord.ButtonStyle.link, url=vouch_link))
+        await interaction.channel.send(f"✅ Deal completed by {interaction.user.mention}. MM count: **{mm_counts[count_key]}**\n{ ' '.join(f'<@{uid}>' for uid in deal.get('participants', [])) }, please vouch in {vouch.mention if vouch else 'the vouches channel'}.", view=button)
+        await mm_save_and_refresh(interaction, deal, MMControlView(self.deal_id))
+        await interaction.response.send_message("✅ Deal completed.", ephemeral=True)
 
 
 class MMClaimView(discord.ui.View):
-
     def __init__(self, deal_id):
         super().__init__(timeout=None)
-        self.deal_id = deal_id
         self.add_item(MMClaimButton(deal_id))
+        self.add_item(MMUnclaimButton(deal_id))
+        self.add_item(MMCompleteButton(deal_id))
 
 
 class MMUserSelect(discord.ui.UserSelect):
-
     def __init__(self, deal_id):
-        super().__init__(
-            placeholder="Select a user",
-            min_values=1,
-            max_values=1,
-            custom_id=f"mm:select:{deal_id}"
-        )
+        super().__init__(placeholder="Select Person", min_values=1, max_values=1, custom_id=f"mm:select:{deal_id}")
         self.deal_id = deal_id
 
-    async def callback(self, interaction: discord.Interaction):
+    async def callback(self, interaction):
         deal = _mm_deals.get(self.deal_id)
         if not deal:
-            await safe_error(interaction, "❌ This ticket is no longer active.")
-            return
-        if deal.get("creator_id") and str(interaction.user.id) != deal.get("creator_id"):
-            await safe_error(interaction, "❌ Only the ticket creator can select the user they're dealing with.")
-            return
-        if not deal.get("creator_id"):
-            deal["creator_id"] = str(interaction.user.id)
+            return await safe_error(interaction, "❌ This ticket is no longer active.")
+        if str(interaction.user.id) != deal.get("creator_id"):
+            return await safe_error(interaction, "❌ Only the ticket creator can select the participant.")
         selected = self.values[0]
-        try:
-            await interaction.channel.set_permissions(
-                selected,
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True
-            )
-        except Exception as e:
-            print(f"[MM ADD USER] {e}")
-        deal["participants"] = [deal["creator_id"], str(selected.id)]
-        deal["confirmed"] = {deal["creator_id"]: False, str(selected.id): False}
-        deal["names"] = {
-            deal["creator_id"]: (interaction.user.display_name or interaction.user.name),
-            str(selected.id): (getattr(selected, "display_name", None) or getattr(selected, "name", None) or str(selected))
-        }
+        if selected.bot or selected.id == interaction.user.id:
+            return await safe_error(interaction, "❌ Select the other human participant.")
+        await mm_set_participant_permissions(interaction.channel, selected)
+        deal["participants"] = [str(interaction.user.id), str(selected.id)]
+        deal["confirmed"] = {str(interaction.user.id): False, str(selected.id): False}
+        deal["amount_confirmed"] = {str(interaction.user.id): False, str(selected.id): False}
+        deal["names"] = {str(interaction.user.id): interaction.user.display_name, str(selected.id): selected.display_name}
         deal["state"] = "entering_deal"
-        save_mm_deals(_mm_deals)
-        try:
-            await interaction.channel.send(f"✅ {selected.mention} has been added to the ticket.")
-        except Exception:
-            pass
-        await interaction.response.send_modal(EnterDealModal(self.deal_id))
+        await mm_log(interaction.guild, deal, "Participant added", interaction.user, f"Added {selected.mention} and invited them to the ticket.")
+        await mm_save_and_refresh(interaction, deal, MMSelectUserView(self.deal_id))
+        await interaction.channel.send(f"✅ {selected.mention} was added and invited. Both users must confirm the deal.", view=DealConfirmView(self.deal_id))
+        await interaction.response.send_message("✅ Participant added.", ephemeral=True)
 
 
 class MMSelectUserView(discord.ui.View):
-
     def __init__(self, deal_id):
         super().__init__(timeout=None)
-        self.deal_id = deal_id
         self.add_item(MMUserSelect(deal_id))
+        self.add_item(MMCloseButton(deal_id))
 
 
 class EnterDealModal(discord.ui.Modal):
-
     def __init__(self, deal_id, existing=None):
         super().__init__(title="Enter Deal")
         self.deal_id = deal_id
         existing = existing or {}
-        self.item_input = discord.ui.TextInput(
-            label="Item Name",
-            placeholder="Item being traded",
-            max_length=100,
-            required=True,
-            default=str(existing.get("item", ""))
-        )
-        self.price_input = discord.ui.TextInput(
-            label="Offer",
-            placeholder="Example: 50.00",
-            max_length=20,
-            required=True,
-            default=str(existing.get("price", ""))
-        )
-        self.payment_input = discord.ui.TextInput(
-            label="Payment Method",
-            placeholder="Example: PayPal, Crypto",
-            max_length=50,
-            required=True,
-            default=str(existing.get("payment_method", ""))
-        )
-        self.add_item(self.item_input)
-        self.add_item(self.price_input)
-        self.add_item(self.payment_input)
+        self.item_input = discord.ui.TextInput(label="Item / Deal", default=str(existing.get("item", "")), max_length=100)
+        self.price_input = discord.ui.TextInput(label="Integer USD value", placeholder="Example: 250", default=str(existing.get("price", "")), max_length=12)
+        self.payment_input = discord.ui.TextInput(label="Payment Method", default=str(existing.get("payment_method", "")), max_length=50)
+        self.add_item(self.item_input); self.add_item(self.price_input); self.add_item(self.payment_input)
 
-    async def on_submit(self, interaction: discord.Interaction):
-        offer = self.price_input.value.strip()
-        if not offer:
-            await interaction.response.send_message("❌ Offer cannot be empty.", ephemeral=True)
-            return
-        price = offer
+    async def on_submit(self, interaction):
+        raw = self.price_input.value.strip()
+        if not raw.isdigit() or int(raw) < 0:
+            return await interaction.response.send_message("❌ USD value must be an integer only.", ephemeral=True)
         deal = _mm_deals.get(self.deal_id)
-        if not deal:
-            await interaction.response.send_message("❌ This ticket is no longer active.", ephemeral=True)
-            return
-        deal["item"] = self.item_input.value.strip()
-        deal["price"] = str(price)
-        deal["payment_method"] = self.payment_input.value.strip()
-        deal["state"] = "confirming"
-        save_mm_deals(_mm_deals)
-        embed = mm_deal_embed(deal)
-        view = DealConfirmView(self.deal_id)
-        if deal.get("deal_message_id"):
-            try:
-                msg = await interaction.channel.fetch_message(int(deal["deal_message_id"]))
-                await msg.edit(embed=embed, view=view)
-            except Exception as e:
-                print(f"[MM EDIT CARD] {e}")
-            await interaction.response.send_message("✅ Deal updated.", ephemeral=True)
-        else:
-            try:
-                msg = await interaction.channel.send(embed=embed, view=view)
-                deal["deal_message_id"] = str(msg.id)
-                save_mm_deals(_mm_deals)
-                await interaction.response.send_message("✅ Deal saved.", ephemeral=True)
-            except Exception as e:
-                print(f"[MM SEND CARD] {e}")
-                reason = str(e)
-                # If embeds are blocked, try a plain-text deal card
-                # so the trade can still proceed.
-                try:
-                    msg = await interaction.channel.send(
-                        content=f"**{deal.get('item')} | {money(deal.get('price'))} | {deal.get('payment_method')}**\n"
-                        + "\n".join(
-                            f"{deal.get('names', {}).get(uid, f'<@{uid}>')}: "
-                            + ("Confirmed ✅" if deal.get("confirmed", {}).get(uid) else "Unconfirmed ❌")
-                            for uid in deal.get("participants", [])
-                        ),
-                        view=view
-                    )
-                    deal["deal_message_id"] = str(msg.id)
-                    save_mm_deals(_mm_deals)
-                    await safe_error(interaction, "✅ Deal saved (plain text).")
-                except Exception as e2:
-                    print(f"[MM SEND CARD FALLBACK] {e2}")
-                    await safe_error(
-                        interaction,
-                        f"❌ Couldn't post the deal card: {reason}"
-                    )
+        if not deal or str(interaction.user.id) not in mm_participant_ids(deal):
+            return await safe_error(interaction, "❌ This deal is no longer active.")
+        deal["item"] = self.item_input.value.strip(); deal["price"] = str(int(raw)); deal["payment_method"] = self.payment_input.value.strip()
+        deal["amount_confirmed"] = {uid: False for uid in mm_participant_ids(deal)}
+        deal["state"] = "confirming_amount"
+        await mm_log(interaction.guild, deal, "USD entered", interaction.user, f"Amount: **${int(raw):,} USD**")
+        await mm_save_and_refresh(interaction, deal, DealConfirmView(self.deal_id))
+        await interaction.channel.send(f"The USD value is **${int(raw):,} USD**. Both users must confirm this exact amount.", view=DealConfirmView(self.deal_id))
+        await interaction.response.send_message("✅ Integer USD value recorded.", ephemeral=True)
 
 
 class MMConfirmButton(discord.ui.Button):
+    def __init__(self, deal_id, user_id, kind):
+        label = "Confirm Deal" if kind == "deal" else "Confirm USD"
+        super().__init__(label=label, style=discord.ButtonStyle.success, custom_id=f"mm:confirm:{kind}:{deal_id}:{user_id}")
+        self.deal_id = deal_id; self.user_id = str(user_id); self.kind = kind
 
-    def __init__(self, deal_id, user_id, label, style):
-        super().__init__(
-            label=label,
-            style=style,
-            custom_id=f"mm:confirm:{deal_id}:{user_id}",
-            row=0
-        )
-        self.deal_id = deal_id
-        self.user_id = user_id
-
-    async def callback(self, interaction: discord.Interaction):
+    async def callback(self, interaction):
         deal = _mm_deals.get(self.deal_id)
-        if not deal:
-            await safe_error(interaction, "❌ This deal is no longer active.")
-            return
-        if str(interaction.user.id) != self.user_id:
-            await safe_error(interaction, "❌ This isn't your confirm button.")
-            return
-        deal["confirmed"][self.user_id] = True
-        save_mm_deals(_mm_deals)
-        embed = mm_deal_embed(deal)
-        view = DealConfirmView(self.deal_id)
-        all_confirmed = all(deal["confirmed"].get(uid) for uid in deal.get("participants", []))
-        if all_confirmed:
-            for child in view.children:
-                child.disabled = True
-        try:
-            await interaction.response.edit_message(embed=embed, view=view)
-        except Exception as e:
-            print(f"[MM CONFIRM EDIT] {e}")
-        if all_confirmed:
-            try:
-                await interaction.followup.send("✅ All participants confirmed. A middleman may now proceed with this ticket.")
-            except Exception:
-                pass
+        if not deal or str(interaction.user.id) != self.user_id:
+            return await safe_error(interaction, "❌ This confirmation button is not assigned to you.")
+        if self.kind == "deal":
+            if deal.get("state") != "entering_deal":
+                return await safe_error(interaction, "❌ Deal confirmation is not currently open.")
+            deal.setdefault("confirmed", {})[self.user_id] = True
+            await mm_log(interaction.guild, deal, "Deal confirmed", interaction.user)
+            if all(deal["confirmed"].get(uid) for uid in mm_participant_ids(deal)):
+                deal["state"] = "entering_amount"; await interaction.channel.send("✅ Both users confirmed the deal. Enter the integer USD value.", view=MMAmountView(self.deal_id))
+        else:
+            if deal.get("state") != "confirming_amount":
+                return await safe_error(interaction, "❌ USD confirmation is not currently open.")
+            deal.setdefault("amount_confirmed", {})[self.user_id] = True
+            await mm_log(interaction.guild, deal, "USD confirmed", interaction.user, f"Amount: {money(deal.get('price'))}")
+            if all(deal["amount_confirmed"].get(uid) for uid in mm_participant_ids(deal)):
+                amount = int(deal["price"]); deal["eligible_roles"] = mm_eligible_keys(amount); deal["state"] = "routed"
+                await mm_apply_routing_permissions(interaction.channel, deal)
+                config = await get_server_config(interaction.guild.id)
+                mentions = [interaction.guild.get_role(mm_int(config.get(k))).mention for k in deal["eligible_roles"] if interaction.guild.get_role(mm_int(config.get(k)))]
+                await interaction.channel.send(f"✅ Both users confirmed {money(amount)}. Eligible MM roles: {' '.join(mentions) or 'none configured'} — claim below.", view=MMClaimView(self.deal_id))
+                await mm_log(interaction.guild, deal, "MM requested", interaction.user, f"Eligible roles: {', '.join(MM_ROLE_LABELS[k] for k in deal['eligible_roles'])}")
+        await mm_save_and_refresh(interaction, deal, DealConfirmView(self.deal_id))
+        await interaction.response.send_message("✅ Confirmation recorded.", ephemeral=True)
+
+
+class DealConfirmView(discord.ui.View):
+    def __init__(self, deal_id):
+        super().__init__(timeout=None); self.deal_id = deal_id
+        deal = _mm_deals.get(deal_id, {})
+        if deal.get("state") == "entering_deal":
+            for uid in mm_participant_ids(deal): self.add_item(MMConfirmButton(deal_id, uid, "deal"))
+        elif deal.get("state") == "confirming_amount":
+            for uid in mm_participant_ids(deal): self.add_item(MMConfirmButton(deal_id, uid, "amount"))
+        self.add_item(MMEditDealButton(deal_id)); self.add_item(MMCloseButton(deal_id))
+
+
+class MMAmountButton(discord.ui.Button):
+    def __init__(self, deal_id):
+        super().__init__(label="Enter USD Value", style=discord.ButtonStyle.primary, custom_id=f"mm:amount:{deal_id}"); self.deal_id = deal_id
+    async def callback(self, interaction):
+        deal = _mm_deals.get(self.deal_id)
+        if not deal or deal.get("state") != "entering_amount" or str(interaction.user.id) not in mm_participant_ids(deal):
+            return await safe_error(interaction, "❌ USD value cannot be entered yet.")
+        await interaction.response.send_modal(EnterDealModal(self.deal_id, existing=deal))
+
+
+class MMAmountView(discord.ui.View):
+    def __init__(self, deal_id):
+        super().__init__(timeout=None); self.add_item(MMAmountButton(deal_id)); self.add_item(MMCloseButton(deal_id))
 
 
 class MMEditDealButton(discord.ui.Button):
-
     def __init__(self, deal_id):
-        super().__init__(
-            label="Edit Deal",
-            emoji="✏️",
-            style=discord.ButtonStyle.secondary,
-            custom_id=f"mm:edit:{deal_id}",
-            row=1
-        )
-        self.deal_id = deal_id
-
-    async def callback(self, interaction: discord.Interaction):
+        super().__init__(label="Edit Deal", style=discord.ButtonStyle.secondary, custom_id=f"mm:edit:{deal_id}"); self.deal_id = deal_id
+    async def callback(self, interaction):
         deal = _mm_deals.get(self.deal_id)
-        if not deal:
-            await safe_error(interaction, "❌ This deal is no longer active.")
-            return
-        if str(interaction.user.id) != deal.get("creator_id"):
-            await safe_error(interaction, "❌ Only the deal creator can edit the deal.")
-            return
+        if not deal or str(interaction.user.id) != deal.get("creator_id"):
+            return await safe_error(interaction, "❌ Only the ticket creator can edit the deal.")
         await interaction.response.send_modal(EnterDealModal(self.deal_id, existing=deal))
 
 
 class MMCloseButton(discord.ui.Button):
-
     def __init__(self, deal_id):
-        super().__init__(
-            label="Close Ticket",
-            emoji="🔒",
-            style=discord.ButtonStyle.danger,
-            custom_id=f"mm:close:{deal_id}",
-            row=1
-        )
-        self.deal_id = deal_id
-
-    async def callback(self, interaction: discord.Interaction):
+        super().__init__(label="Close Ticket", emoji="🔒", style=discord.ButtonStyle.danger, custom_id=f"mm:close:{deal_id}"); self.deal_id = deal_id
+    async def callback(self, interaction):
         deal = _mm_deals.get(self.deal_id)
-        if not deal:
-            await safe_error(interaction, "❌ This ticket is no longer active.")
-            return
-        if str(interaction.user.id) != deal.get("creator_id"):
-            await safe_error(interaction, "❌ Only the ticket creator can close this ticket.")
-            return
-        await interaction.response.send_message("🔒 Closing ticket...", ephemeral=True)
-        _mm_deals.pop(self.deal_id, None)
-        save_mm_deals(_mm_deals)
-        try:
-            await interaction.channel.delete(reason=f"MM ticket closed by {interaction.user}")
-        except Exception as e:
-            print(f"[MM CLOSE] {e}")
+        if not deal or (str(interaction.user.id) not in mm_participant_ids(deal) and not mm_is_staff(interaction.user, await get_server_config(interaction.guild.id))):
+            return await safe_error(interaction, "❌ Only a participant or staff member can close this ticket.")
+        await mm_close_ticket(interaction.guild, interaction.channel, deal, interaction.user, "closed by user/staff")
+        await interaction.response.send_message("🔒 Ticket closed.", ephemeral=True)
 
 
-class DealConfirmView(discord.ui.View):
-
+class MMControlView(discord.ui.View):
     def __init__(self, deal_id):
-        super().__init__(timeout=None)
-        self.deal_id = deal_id
-        deal = _mm_deals.get(deal_id, {})
-        participants = deal.get("participants", [])
-        confirmed = deal.get("confirmed", {})
-        names = deal.get("names", {})
-        for uid in participants:
-            name = names.get(uid, uid)
-            is_confirmed = confirmed.get(uid, False)
-            label = f"{name} Confirmed" if is_confirmed else f"{name} Confirm"
-            style = discord.ButtonStyle.primary if is_confirmed else discord.ButtonStyle.success
-            self.add_item(MMConfirmButton(deal_id, uid, label, style))
-        self.add_item(MMEditDealButton(deal_id))
-        self.add_item(MMCloseButton(deal_id))
-        if participants and all(confirmed.get(uid) for uid in participants):
-            for child in self.children:
-                child.disabled = True
+        super().__init__(timeout=None); self.add_item(MMCloseButton(deal_id))
 
 
-# ============================================================
-# /MM
-# ============================================================
+class MMStaffReopenButton(discord.ui.Button):
+    def __init__(self, deal_id):
+        super().__init__(label="Reopen", style=discord.ButtonStyle.success, custom_id=f"mm:reopen:{deal_id}"); self.deal_id = deal_id
+    async def callback(self, interaction):
+        config = await get_server_config(interaction.guild.id)
+        if not mm_is_staff(interaction.user, config): return await safe_error(interaction, "❌ Staff only.")
+        deal = _mm_deals.get(self.deal_id)
+        if not deal: return await safe_error(interaction, "❌ Ticket data not found.")
+        deal["status"] = "open"; deal["state"] = deal.get("state_before_close", "in_progress"); deal["last_activity"] = time.time(); deal["inactivity_warning_at"] = None
+        for uid in mm_participant_ids(deal):
+            member = interaction.guild.get_member(mm_int(uid))
+            if member: await mm_set_participant_permissions(interaction.channel, member)
+        await mm_log(interaction.guild, deal, "Reopened", interaction.user); save_mm_deals(_mm_deals)
+        await interaction.response.send_message("✅ Ticket reopened.", ephemeral=True)
 
-@bot.tree.command(
-    name="mm",
-    description="Request a middleman — opens an MM ticket."
-)
+
+class MMStaffDeleteButton(discord.ui.Button):
+    def __init__(self, deal_id):
+        super().__init__(label="Delete", style=discord.ButtonStyle.danger, custom_id=f"mm:delete:{deal_id}"); self.deal_id = deal_id
+    async def callback(self, interaction):
+        config = await get_server_config(interaction.guild.id)
+        if not mm_is_staff(interaction.user, config): return await safe_error(interaction, "❌ Staff only.")
+        deal = _mm_deals.get(self.deal_id)
+        if deal:
+            deal["status"] = "deleted"; await mm_log(interaction.guild, deal, "Deleted", interaction.user); save_mm_deals(_mm_deals)
+        await interaction.response.send_message("🗑️ Deleting ticket.", ephemeral=True); await interaction.channel.delete(reason=f"Deleted by {interaction.user}")
+
+
+class MMStaffView(discord.ui.View):
+    def __init__(self, deal_id):
+        super().__init__(timeout=None); self.add_item(MMStaffReopenButton(deal_id)); self.add_item(MMStaffDeleteButton(deal_id))
+
+
+class MMKeepOpenButton(discord.ui.Button):
+    def __init__(self, deal_id):
+        super().__init__(label="Keep Open", style=discord.ButtonStyle.success, custom_id=f"mm:keep:{deal_id}"); self.deal_id = deal_id
+    async def callback(self, interaction):
+        deal = _mm_deals.get(self.deal_id)
+        if not deal or str(interaction.user.id) not in mm_participant_ids(deal): return await safe_error(interaction, "❌ Participants only.")
+        deal["last_activity"] = time.time(); deal["inactivity_warning_at"] = None; save_mm_deals(_mm_deals)
+        await mm_log(interaction.guild, deal, "Keep Open", interaction.user); await interaction.response.send_message("✅ Kept open. The 10-hour timer restarted.", ephemeral=True)
+
+
+class MMInactiveCloseButton(discord.ui.Button):
+    def __init__(self, deal_id):
+        super().__init__(label="Close", style=discord.ButtonStyle.danger, custom_id=f"mm:inactive-close:{deal_id}"); self.deal_id = deal_id
+    async def callback(self, interaction):
+        deal = _mm_deals.get(self.deal_id)
+        if not deal or str(interaction.user.id) not in mm_participant_ids(deal): return await safe_error(interaction, "❌ Participants only.")
+        await mm_close_ticket(interaction.guild, interaction.channel, deal, interaction.user, "closed from inactivity warning"); await interaction.response.send_message("🔒 Ticket closed.", ephemeral=True)
+
+
+class MMInactivityView(discord.ui.View):
+    def __init__(self, deal_id):
+        super().__init__(timeout=None); self.add_item(MMKeepOpenButton(deal_id)); self.add_item(MMInactiveCloseButton(deal_id))
+
+
+MM_COUNTS_FILE = Path("mm_counts.json")
+def load_mm_counts():
+    try: return json.loads(MM_COUNTS_FILE.read_text()) if MM_COUNTS_FILE.exists() else {}
+    except Exception: return {}
+def save_mm_counts(value): MM_COUNTS_FILE.write_text(json.dumps(value, indent=2))
+
+
+@bot.tree.command(name="mm-count-reset", description="Reset a middleman's completed ticket count.")
+@app_commands.checks.has_permissions(administrator=True)
+async def mm_count_reset(interaction: discord.Interaction, member: discord.Member):
+    counts = load_mm_counts(); key = f"{interaction.guild.id}:{member.id}"; old = counts.pop(key, 0); save_mm_counts(counts)
+    await interaction.response.send_message(f"✅ Reset {member.mention}'s MM count from **{old}** to **0**.", ephemeral=True)
+
+
+@tasks.loop(minutes=1)
+async def mm_inactivity_loop():
+    current = time.time()
+    for deal in list(_mm_deals.values()):
+        if deal.get("status") in ("closed", "deleted", "completed"):
+            continue
+        last = float(deal.get("last_activity", current)); warning = deal.get("inactivity_warning_at")
+        channel = bot.get_channel(mm_int(deal.get("ticket_channel_id")))
+        if not channel: continue
+        if not warning and current - last >= 10 * 3600:
+            deal["inactivity_warning_at"] = current; await channel.send("⚠️ This ticket has been inactive for 10 hours.", view=MMInactivityView(deal["deal_id"])); await mm_log(channel.guild, deal, "Inactivity warning")
+        elif warning and current - float(warning) >= 6 * 3600:
+            await mm_close_ticket(channel.guild, channel, deal, None, "auto-closed after 6 hours without response")
+    save_mm_deals(_mm_deals)
+
+
+@mm_inactivity_loop.before_loop
+async def before_mm_inactivity_loop():
+    await bot.wait_until_ready()
+
+
+_original_on_ready = bot.on_ready
+@bot.event
+async def on_ready():
+    await _original_on_ready()
+    if not mm_inactivity_loop.is_running(): mm_inactivity_loop.start()
+
+
+@bot.tree.command(name="mm", description="Request a private SDBST middleman ticket.")
 async def mm(interaction: discord.Interaction):
     if interaction.guild is None:
-        await safe_error(interaction, "❌ This command must be used inside a server.")
-        return
+        return await safe_error(interaction, "❌ Use this command inside a server.")
     config = await get_server_config(interaction.guild.id)
-    category_id = config.get("ticket_category_id")
-    if not category_id:
-        await safe_error(interaction, "❌ Tickets aren't configured. Ask an admin to run `/setup`.")
-        return
-    try:
-        category_id = int(category_id)
-    except (TypeError, ValueError):
-        await safe_error(interaction, "❌ Ticket category configuration is invalid.")
-        return
-    category = interaction.guild.get_channel(category_id)
+    category = interaction.guild.get_channel(mm_int(config.get("ticket_category_id") or config.get("mm_ticket_category_id")))
     if not isinstance(category, discord.CategoryChannel):
-        await safe_error(interaction, "❌ The configured ticket category doesn't exist.")
-        return
+        return await safe_error(interaction, "❌ Configure a ticket category in `/setup` first.")
     await interaction.response.defer(ephemeral=True)
-    ticket_num = random.randint(1000, 9999)
-    channel_name = f"need-middleman-{ticket_num}"
-    _pending_mm_channels.add(
-        (interaction.guild.id, channel_name)
-    )
-    overwrites = {
-        interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-        interaction.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True)
-    }
-    try:
-        ticket_channel = await interaction.guild.create_text_channel(
-            name=channel_name,
-            category=category,
-            overwrites=overwrites,
-            topic=f"SDBST Middleman Ticket • {interaction.user}"
-        )
-    except discord.Forbidden:
-        await interaction.followup.send("❌ I don't have permission to create ticket channels.", ephemeral=True)
-        return
-    except discord.HTTPException as e:
-        print(f"[MM CHANNEL] {e}")
-        await interaction.followup.send("❌ Discord failed to create the ticket.", ephemeral=True)
-        return
-    deal_id = uuid.uuid4().hex[:8]
-    claim_embed = discord.Embed(
-        title="Ticket Created",
-        description=(
-            f"{interaction.user.mention}\n\n"
-            "Automatically state the user and deal in the ticket\n"
-            "To ensure ur safety\n"
-            "All activities within your MM tickets will be recorded including edited messages and deleted images"
-        ),
-        color=discord.Color.blue()
-    )
-    claim_embed.set_footer(text="SDBST Support | SDBST")
-    try:
-        claim_msg = await ticket_channel.send(embed=claim_embed, view=MMClaimView(deal_id))
-    except Exception as e:
-        print(f"[MM CLAIM MSG] {e}")
-        claim_msg = None
-    select_embed = discord.Embed(
-        description=(
-            "**Who are you dealing with?**\n"
-            "Please select from the dropdown, ping them, or type their user ID."
-        ),
-        color=discord.Color.blue()
-    )
-    try:
-        select_msg = await ticket_channel.send(embed=select_embed, view=MMSelectUserView(deal_id))
-    except Exception as e:
-        print(f"[MM SELECT MSG] {e}")
-        select_msg = None
-    _mm_deals[deal_id] = {
-        "guild_id": str(interaction.guild.id),
-        "ticket_channel_id": str(ticket_channel.id),
-        "creator_id": str(interaction.user.id),
-        "participants": [],
-        "confirmed": {},
-        "names": {},
-        "item": None,
-        "price": None,
-        "payment_method": None,
-        "claimed_by": None,
-        "claim_message_id": str(claim_msg.id) if claim_msg else None,
-        "select_message_id": str(select_msg.id) if select_msg else None,
-        "deal_message_id": None,
-        "state": "awaiting_user"
-    }
+    deal_id = uuid.uuid4().hex[:10]
+    channel_name = f"need-middleman-{deal_id[:5]}"
+    staff = interaction.guild.get_role(mm_int(config.get("staff_role_id")))
+    overwrites = {interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False), interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True), interaction.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True)}
+    if staff:
+        overwrites[staff] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    ticket_channel = await interaction.guild.create_text_channel(channel_name, category=category, overwrites=overwrites, topic=f"SDBST MM Ticket {deal_id}")
+    _mm_deals[deal_id] = {"deal_id": deal_id, "guild_id": str(interaction.guild.id), "ticket_channel_id": str(ticket_channel.id), "creator_id": str(interaction.user.id), "participants": [str(interaction.user.id)], "confirmed": {}, "amount_confirmed": {}, "names": {str(interaction.user.id): interaction.user.display_name}, "state": "awaiting_user", "status": "open", "claimed_by": None, "eligible_roles": [], "last_activity": time.time(), "inactivity_warning_at": None, "deal_message_id": None}
+    select = await ticket_channel.send(embed=discord.Embed(title="SDBST MM Ticket", description=f"{interaction.user.mention}, select the other participant. Staff can view this ticket.", color=discord.Color.blurple()), view=MMSelectUserView(deal_id))
+    _mm_deals[deal_id]["select_message_id"] = str(select.id)
     save_mm_deals(_mm_deals)
-    if claim_msg and select_msg:
-        await interaction.followup.send(f"🤝 Middleman ticket opened: {ticket_channel.mention}", ephemeral=True)
-    else:
-        await interaction.followup.send("⚠️ Ticket created, but some setup messages failed to send.", ephemeral=True)
+    await mm_log(interaction.guild, _mm_deals[deal_id], "Created", interaction.user)
+    await interaction.followup.send(f"✅ Private MM ticket created: {ticket_channel.mention}", ephemeral=True)
+
+
+@bot.tree.command(name="mm-setup", description="Configure SDBST MM log, vouches, staff, and six MM roles.")
+@app_commands.checks.has_permissions(administrator=True)
+async def mm_setup(interaction: discord.Interaction, log_channel: discord.TextChannel, vouches_channel: discord.TextChannel, staff_role: discord.Role, trial_mm: discord.Role, mm_role: discord.Role, sr_mm: discord.Role, head_mm: discord.Role, admin_mm: discord.Role, founder_mm: discord.Role):
+    values = {"log_channel_id": log_channel.id, "vouches_channel_id": vouches_channel.id, "staff_role_id": staff_role.id, "mm_trial_role_id": trial_mm.id, "mm_role_id": mm_role.id, "mm_sr_role_id": sr_mm.id, "mm_head_role_id": head_mm.id, "mm_admin_role_id": admin_mm.id, "mm_founder_role_id": founder_mm.id}
+    await api.patch_config(interaction.guild.id, {key: str(value) for key, value in values.items()})
+    await interaction.response.send_message("✅ MM channels, staff role, and Trial/MM/SR/Head/Admin/Founder roles saved. The existing `/setup` command still controls the ticket category.", ephemeral=True)
+
+
+# Replace the original MM command with a panel-friendly command while keeping all marketplace commands intact.
+@bot.tree.command(name="mm-panel", description="Post the SDBST Request MM panel.")
+@app_commands.checks.has_permissions(administrator=True)
+async def mm_panel(interaction: discord.Interaction):
+    await interaction.channel.send(embed=discord.Embed(title="SDBST Middleman System", description="Press **Request MM** to create a private ticket.", color=discord.Color.blurple()), view=MMRequestView())
+    await interaction.response.send_message("✅ MM panel posted.", ephemeral=True)
+
+
+class MMRequestButton(discord.ui.Button):
+    def __init__(self): super().__init__(label="Request MM", style=discord.ButtonStyle.primary, custom_id="mm:request")
+    async def callback(self, interaction): await mm(interaction)
+class MMRequestView(discord.ui.View):
+    def __init__(self): super().__init__(timeout=None); self.add_item(MMRequestButton())
 
 
 # ============================================================
 # RESTORE MM VIEWS
 # ============================================================
-
 async def restore_mm_views():
-    count = 0
+    restored = 0
     for deal_id, deal in list(_mm_deals.items()):
-        guild = None
         try:
-            guild = bot.get_guild(int(deal["guild_id"]))
-        except Exception:
-            guild = None
-        if guild is None:
-            continue
-        if deal.get("claim_message_id") and not deal.get("claimed_by"):
-            try:
-                bot.add_view(MMClaimView(deal_id), message_id=int(deal["claim_message_id"]))
-                count += 1
-            except Exception as e:
-                print(f"[RESTORE MM CLAIM] {e}")
-        if deal.get("select_message_id") and deal.get("state") == "awaiting_user":
-            try:
+            if deal.get("select_message_id") and deal.get("state") == "awaiting_user":
                 bot.add_view(MMSelectUserView(deal_id), message_id=int(deal["select_message_id"]))
-                count += 1
-            except Exception as e:
-                print(f"[RESTORE MM SELECT] {e}")
-        if deal.get("deal_message_id") and deal.get("state") == "confirming":
-            try:
+                restored += 1
+            if deal.get("deal_message_id") and deal.get("state") in ("entering_deal", "confirming", "confirming_amount"):
                 bot.add_view(DealConfirmView(deal_id), message_id=int(deal["deal_message_id"]))
-                count += 1
-            except Exception as e:
-                print(f"[RESTORE MM DEAL] {e}")
-    print(f"[RESTORE MM] Restored {count} MM view(s).")
+                restored += 1
+            if deal.get("state") == "entering_amount":
+                bot.add_view(MMAmountView(deal_id))
+                restored += 1
+            if deal.get("state") in ("routed", "in_progress"):
+                bot.add_view(MMClaimView(deal_id))
+                restored += 1
+        except Exception as exc:
+            print(f"[RESTORE MM] {deal_id}: {exc}")
+    print(f"[RESTORE MM] Restored {restored} view(s).")
 
 
 # ============================================================
@@ -4168,9 +4131,6 @@ async def on_message(message):
     config = await cached_config_safe(
         message.guild.id
     )
-    if is_negotiation_channel(message.channel, config):
-        _negotiation_message_cache[message.id] = message
-        await log_negotiation_event(message, config, "MESSAGE")
 
     # ----------------------------------------------------
     # Closed ticket: users cannot view or send messages.
@@ -4281,27 +4241,6 @@ async def on_message(message):
         )
 
     await bot.process_commands(message)
-
-
-@bot.event
-async def on_message_edit(before, after):
-    if after.guild is None:
-        return
-    config = await cached_config_safe(after.guild.id)
-    if is_negotiation_channel(after.channel, config):
-        _negotiation_message_cache[after.id] = after
-        await log_negotiation_event(after, config, "EDITED")
-
-
-@bot.event
-async def on_raw_message_delete(payload):
-    message = _negotiation_message_cache.pop(payload.message_id, None)
-    if message is None or message.guild is None:
-        return
-    config = await cached_config_safe(message.guild.id)
-    if not is_negotiation_channel(message.channel, config):
-        return
-    await log_negotiation_event(message, config, "DELETED")
 
 
 # ============================================================
@@ -4464,20 +4403,96 @@ async def create_trade_ticket(guild, buyer, seller, item, price, ad_id):
 # ============================================================
 
 class StockBuyButton(discord.ui.Button):
-    def __init__(self, post_id, buy_link):
-        super().__init__(
-            label="Buy This Item",
-            emoji="🛒",
-            style=discord.ButtonStyle.link,
-            url=buy_link,
-            row=0
-        )
+    def __init__(self, post_id):
+        super().__init__(label="Buy This Item", emoji="🛒", style=discord.ButtonStyle.secondary, custom_id=f"stock:buy:{post_id}")
         self.post_id = post_id
+
+    async def callback(self, interaction: discord.Interaction):
+        # Acknowledge immediately; ticket creation performs network/API work.
+        await interaction.response.defer(ephemeral=True)
+        post = _stock_posts.get(self.post_id)
+        if not post:
+            await safe_error(interaction, "❌ This stock item is no longer available.")
+            return
+        guild = interaction.guild
+        if guild is None:
+            await safe_error(interaction, "❌ This can only be used inside a server.")
+            return
+        try:
+            seller = await guild.fetch_member(int(post["poster_id"]))
+        except Exception as e:
+            print(f"[STOCK BUY SELLER] {e}")
+            await safe_error(interaction, "❌ Couldn't find the seller.")
+            return
+        if interaction.user.id == seller.id:
+            await safe_error(interaction, "❌ You can't buy your own stock item.")
+            return
+        # Tickets reference an existing backend ad. Stock posts are stored
+        # locally, so create the corresponding WTS ad record on first buy.
+        stock_ad_id = post.get("ad_id")
+        if not stock_ad_id:
+            try:
+                stock_ad = await api.create_ad({
+                    "server_id": str(guild.id),
+                    "owner_id": str(seller.id),
+                    "ad_type": "WTS",
+                    "item": str(post.get("name") or "Stock item"),
+                    "price": str(post.get("price") or "0"),
+                    "message_id": str(post.get("message_id") or interaction.message.id),
+                    "channel_id": str(post.get("channel_id") or interaction.channel.id),
+                })
+                stock_ad_id = stock_ad.get("ad_id") if isinstance(stock_ad, dict) else None
+                if not stock_ad_id:
+                    raise RuntimeError(f"Backend returned no ad_id: {stock_ad!r}")
+                post["ad_id"] = str(stock_ad_id)
+                _stock_posts[self.post_id] = post
+                save_stock_posts(_stock_posts)
+            except Exception as e:
+                print(f"[STOCK AD CREATE] {e}")
+                await safe_error(interaction, "❌ The stock item couldn't be registered with the backend. Please try again.")
+                return
+        result = await create_trade_ticket(guild, interaction.user, seller, post.get("name"), post.get("price"), stock_ad_id)
+        if not result["ok"]:
+            await safe_error(interaction, result["error"])
+            return
+        ticket_channel = result["channel"]
+        ticket_record = result["record"]
+        ticket_config = await get_server_config(guild.id)
+        ticket_message = None
+        try:
+            ticket_message = await ticket_channel.send(
+                content=(
+                    f"{seller.mention} {interaction.user.mention}\n\n"
+                    f"🎫 **Trade ticket opened**\n"
+                    f"**Item:** {post.get('name')}\n"
+                    f"**Price:** {money(post.get('price'))}\n"
+                    f"**Buyer:** {interaction.user.mention}\n"
+                    f"**Seller:** {seller.mention}\n\n"
+                    f"{NEGOTIATE_LINE}"
+                ),
+                view=TicketButtons(
+                    ticket_record,
+                    mm_link=(
+                        f"https://discord.com/channels/{guild.id}/{ticket_config.get('mm_channel_id')}"
+                        if ticket_config.get("mm_channel_id") else None
+                    )
+                )
+            )
+        except Exception as e:
+            print(f"[STOCK TICKET MSG] {e}")
+        if ticket_message is not None:
+            ticket_link = ticket_message.jump_url
+        else:
+            ticket_link = f"https://discord.com/channels/{guild.id}/{ticket_channel.id}"
+        await interaction.followup.send(
+            f"[Open your trade ticket ✔️]({ticket_link})\n💬 Negotiate the deal in the opened ticket.",
+            ephemeral=True
+        )
 
 
 class StockSoldButton(discord.ui.Button):
     def __init__(self, post_id):
-        super().__init__(label="Sold", style=discord.ButtonStyle.danger, custom_id=f"stock:sold:{post_id}")
+        super().__init__(label="Sold", emoji="✅", style=discord.ButtonStyle.danger, custom_id=f"stock:sold:{post_id}")
         self.post_id = post_id
 
     async def callback(self, interaction: discord.Interaction):
@@ -4494,10 +4509,10 @@ class StockSoldButton(discord.ui.Button):
 
 
 class StockPostButtons(discord.ui.View):
-    def __init__(self, post_id, buy_link):
+    def __init__(self, post_id):
         super().__init__(timeout=None)
         self.post_id = post_id
-        self.add_item(StockBuyButton(post_id, buy_link))
+        self.add_item(StockBuyButton(post_id))
         self.add_item(StockSoldButton(post_id))
 
 
@@ -4595,10 +4610,9 @@ async def delete_duplicate_ads(guild, user_id, ad_type, item):
                 continue
             if str(ad.get("owner_id")) != str(user_id):
                 continue
-            if str(ad.get("ad_type", "")).upper() != str(ad_type).upper():
+            if ad.get("ad_type") != ad_type:
                 continue
-            normalize = lambda value: " ".join(str(value or "").casefold().split())
-            if normalize(ad.get("item")) != normalize(item):
+            if str(ad.get("item", "")).strip().lower() != item.lower():
                 continue
             try:
                 old_ch = guild.get_channel(int(ad.get("channel_id")))
@@ -4623,16 +4637,7 @@ async def restore_stock_views():
     count = 0
     for post_id, post in list(_stock_posts.items()):
         try:
-            guild = bot.get_guild(int(post["guild_id"]))
-            config = await get_server_config(guild.id) if guild else {}
-            buy_channel_id = config.get("stock_buy_channel_id")
-            buy_channel = guild.get_channel(int(buy_channel_id)) if guild and buy_channel_id else None
-            if not isinstance(buy_channel, discord.TextChannel):
-                buy_channel = guild.get_channel(int(post["channel_id"])) if guild else None
-            if not isinstance(buy_channel, discord.TextChannel):
-                raise RuntimeError("No valid Buy This Item destination channel")
-            buy_link = f"https://discord.com/channels/{guild.id}/{buy_channel.id}"
-            bot.add_view(StockPostButtons(post_id, buy_link), message_id=int(post["message_id"]))
+            bot.add_view(StockPostButtons(post_id), message_id=int(post["message_id"]))
             count += 1
         except Exception as e:
             print(f"[RESTORE STOCK] {e}")
@@ -4705,17 +4710,7 @@ class StockCog(commands.Cog):
         if img:
             embed.set_thumbnail(url=img)
         post_id = uuid.uuid4().hex[:8]
-        buy_channel_id = config.get("stock_buy_channel_id")
-        buy_channel = None
-        if buy_channel_id:
-            try:
-                buy_channel = interaction.guild.get_channel(int(buy_channel_id))
-            except (TypeError, ValueError):
-                buy_channel = None
-        if not isinstance(buy_channel, discord.TextChannel):
-            buy_channel = stock_channel
-        buy_link = f"https://discord.com/channels/{interaction.guild.id}/{buy_channel.id}"
-        view = StockPostButtons(post_id, buy_link)
+        view = StockPostButtons(post_id)
         try:
             msg = await stock_channel.send(embed=embed, view=view)
         except Exception as e:
@@ -4730,7 +4725,6 @@ class StockCog(commands.Cog):
             "name": name,
             "price": str(price_val),
             "image": img or None,
-            "buy_channel_id": str(buy_channel.id),
         }
         save_stock_posts(_stock_posts)
         await interaction.followup.send(f"✅ Stock item posted in {stock_channel.mention}.", ephemeral=True)
