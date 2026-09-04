@@ -6,7 +6,7 @@ import time
 import asyncio
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import httpx
 import json
@@ -4304,7 +4304,7 @@ from pathlib import Path
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 
 # ============================================================
