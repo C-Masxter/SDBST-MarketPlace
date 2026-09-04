@@ -3707,9 +3707,9 @@ class USDValueModal(discord.ui.Modal):
         super().__init__(title="Confirm USD Deal Value")
         self.deal_id = deal_id
         self.value_input = discord.ui.TextInput(
-            label="USD Value (integer only)",
-            placeholder="Example: 105",
-            max_length=12,
+            label="Offer / USD Value",
+            placeholder="Example: 105 USD, 500 Robux, or an item",
+            max_length=100,
             required=True
         )
         self.add_item(self.value_input)
@@ -3735,6 +3735,34 @@ class USDValueModal(discord.ui.Modal):
         deal["usd_message_id"] = str(msg.id)
         save_mm_deals(_mm_deals)
         await interaction.response.send_message("✅ USD value posted. Both users must confirm it.", ephemeral=True)
+
+
+class PaymentMethodButton(discord.ui.Button):
+    METHODS = {
+        "robux": ("Robux", "💎", discord.ButtonStyle.success),
+        "paypal": ("PayPal", "💳", discord.ButtonStyle.primary),
+        "crypto": ("Crypto", "₿", discord.ButtonStyle.secondary),
+        "other": ("Other", "🧾", discord.ButtonStyle.secondary),
+    }
+
+    def __init__(self, deal_id, method):
+        label, emoji, style = self.METHODS[method]
+        super().__init__(label=label, emoji=emoji, style=style, custom_id=f"mm:payment:{deal_id}:{method}", row=1)
+        self.deal_id = deal_id
+        self.method = method
+
+    async def callback(self, interaction):
+        deal = _mm_deals.get(self.deal_id)
+        if not deal or str(interaction.user.id) not in {str(uid) for uid in deal.get("participants", [])}:
+            await safe_error(interaction, "❌ Only the deal participants can choose the payment method.")
+            return
+        label = self.METHODS[self.method][0]
+        deal["payment_method"] = label
+        save_mm_deals(_mm_deals)
+        try:
+            await interaction.response.edit_message(embed=mm_deal_embed(deal), view=USDConfirmView(self.deal_id))
+        except Exception as e:
+            print(f"[MM PAYMENT METHOD] {e}")
 
 
 class USDConfirmButton(discord.ui.Button):
@@ -3768,6 +3796,8 @@ class USDConfirmView(discord.ui.View):
         deal = _mm_deals.get(deal_id, {})
         for uid in deal.get("participants", []):
             self.add_item(USDConfirmButton(deal_id, uid, bool(deal.get("usd_confirmed", {}).get(uid))))
+        for method in PaymentMethodButton.METHODS:
+            self.add_item(PaymentMethodButton(deal_id, method))
 
 
 class MMRoutingSelect(discord.ui.Select):
@@ -3821,7 +3851,7 @@ class EnterDealModal(discord.ui.Modal):
             label="Payment Method",
             placeholder="Example: PayPal, Crypto",
             max_length=50,
-            required=True,
+            required=False,
             default=str(existing.get("payment_method", ""))
         )
         self.add_item(self.item_input)
@@ -3840,7 +3870,7 @@ class EnterDealModal(discord.ui.Modal):
             return
         deal["item"] = self.item_input.value.strip()
         deal["price"] = str(price)
-        deal["payment_method"] = self.payment_input.value.strip()
+        deal["payment_method"] = self.payment_input.value.strip() or "Not selected"
         deal["confirmed"] = {uid: False for uid in deal.get("participants", [])}
         deal["state"] = "confirming"
         save_mm_deals(_mm_deals)
