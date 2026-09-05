@@ -3709,11 +3709,17 @@ class MMRoleDecisionButton(discord.ui.Button):
             save_mm_deals(_mm_deals)
             await interaction.response.edit_message(embed=role_selection_embed(deal), view=MMRoleView(self.deal_id))
             return
-        deal.setdefault("role_confirmed", {})[str(interaction.user.id)] = True
-        if all(deal["role_confirmed"].get(uid) for uid in deal.get("participants", [])):
+        role_confirmed = deal.setdefault("role_confirmed", {})
+        role_confirmed[str(interaction.user.id)] = not bool(role_confirmed.get(str(interaction.user.id)))
+        if all(role_confirmed.get(uid) for uid in deal.get("participants", [])):
             deal["state"] = "entering_deal"
             save_mm_deals(_mm_deals)
-            await interaction.response.send_modal(EnterDealModal(self.deal_id))
+            try:
+                await interaction.response.send_modal(USDValueModal(self.deal_id))
+            except Exception as e:
+                print(f"[MM ROLE USD MODAL] deal={self.deal_id}: {e}")
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("❌ Could not open the offer form. Please click Correct again.", ephemeral=True)
         else:
             save_mm_deals(_mm_deals)
             await interaction.response.edit_message(embed=role_confirmation_embed(deal), view=MMRoleConfirmView(self.deal_id))
@@ -3877,17 +3883,18 @@ class USDValueModal(discord.ui.Modal):
         self.add_item(self.value_input)
 
     async def on_submit(self, interaction):
+        await interaction.response.defer(ephemeral=True)
         raw = self.value_input.value.strip()
         try:
             value = int(raw)
             if value < 0:
                 raise ValueError
         except ValueError:
-            await interaction.response.send_message("❌ Enter a whole USD amount, such as `105`.", ephemeral=True)
+            await interaction.followup.send("❌ Enter a whole USD amount, such as `105`.", ephemeral=True)
             return
         deal = _mm_deals.get(self.deal_id)
         if not deal:
-            await interaction.response.send_message("❌ This deal is no longer active.", ephemeral=True)
+            await interaction.followup.send("❌ This deal is no longer active.", ephemeral=True)
             return
         deal["price"] = str(value)
         deal["usd_confirmed"] = {uid: False for uid in deal.get("participants", [])}
@@ -3896,7 +3903,7 @@ class USDValueModal(discord.ui.Modal):
         msg = await interaction.channel.send(embed=mm_deal_embed(deal), view=USDConfirmView(self.deal_id))
         deal["usd_message_id"] = str(msg.id)
         save_mm_deals(_mm_deals)
-        await interaction.response.send_message("🟢 USD value posted. Both users must confirm it.", ephemeral=True)
+        await interaction.followup.send("🟢 USD value posted. Both users must confirm it.", ephemeral=True)
 
 
 class PaymentMethodButton(discord.ui.Button):
