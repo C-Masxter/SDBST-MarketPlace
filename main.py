@@ -3691,51 +3691,71 @@ class MMRoleView(discord.ui.View):
             pass
 
 
-class MMRoleConfirmButton(discord.ui.Button):
-    def __init__(self, deal_id, user_id, correct=True):
-        super().__init__(label="Correct" if correct else "Incorrect", emoji="🟢" if correct else "🔴", style=discord.ButtonStyle.success if correct else discord.ButtonStyle.danger, custom_id=f"mm:role_confirm:{deal_id}:{user_id}:{int(correct)}")
+class MMRoleDecisionButton(discord.ui.Button):
+    def __init__(self, deal_id, correct=True):
+        super().__init__(label="Correct" if correct else "Incorrect", style=discord.ButtonStyle.success if correct else discord.ButtonStyle.danger, custom_id=f"mm:role_decision:{deal_id}:{int(correct)}")
         self.deal_id = deal_id
-        self.user_id = user_id
         self.correct = correct
 
     async def callback(self, interaction):
         deal = _mm_deals.get(self.deal_id)
-        if not deal or str(interaction.user.id) != self.user_id:
-            await safe_error(interaction, "❌ This role confirmation is not assigned to you.")
+        if not deal or str(interaction.user.id) not in {str(uid) for uid in deal.get("participants", [])}:
+            await safe_error(interaction, "❌ Only the two participants can confirm the roles.")
             return
         if not self.correct:
             deal["roles"] = {}
             deal["role_confirmed"] = {}
             deal["state"] = "selecting_roles"
             save_mm_deals(_mm_deals)
-            await interaction.response.edit_message(content="Select your roles again.", embed=None, view=MMRoleView(self.deal_id))
+            await interaction.response.edit_message(embed=role_selection_embed(deal), view=MMRoleView(self.deal_id))
             return
-        deal.setdefault("role_confirmed", {})[self.user_id] = True
+        deal.setdefault("role_confirmed", {})[str(interaction.user.id)] = True
         if all(deal["role_confirmed"].get(uid) for uid in deal.get("participants", [])):
             deal["state"] = "entering_deal"
             save_mm_deals(_mm_deals)
             await interaction.response.send_modal(EnterDealModal(self.deal_id))
         else:
             save_mm_deals(_mm_deals)
-            await interaction.response.edit_message(embed=discord.Embed(title="Confirm Roles", description=role_summary(deal), color=discord.Color.blurple()), view=MMRoleConfirmView(self.deal_id))
+            await interaction.response.edit_message(embed=role_confirmation_embed(deal), view=MMRoleConfirmView(self.deal_id))
 
 
 class MMRoleConfirmView(discord.ui.View):
     def __init__(self, deal_id):
         super().__init__(timeout=None)
-        deal = _mm_deals.get(deal_id, {})
-        for uid in deal.get("participants", []):
-            self.add_item(MMRoleConfirmButton(deal_id, uid, True))
-            self.add_item(MMRoleConfirmButton(deal_id, uid, False))
+        self.add_item(MMRoleDecisionButton(deal_id, True))
+        self.add_item(MMRoleDecisionButton(deal_id, False))
 
 
 def role_summary(deal):
-    names = deal.get("names", {})
-    lines = []
-    for uid in deal.get("participants", []):
-        role = str(deal.get("roles", {}).get(uid, "")).title() or "Not selected"
-        lines.append(f"<@{uid}> — **{role}**")
-    return "\n".join(lines) or "No roles selected yet."
+    buyer = next((f"<@{uid}>" for uid, role in deal.get("roles", {}).items() if role == "buyer"), "")
+    seller = next((f"<@{uid}>" for uid, role in deal.get("roles", {}).items() if role == "seller"), "")
+    return f"**Buyer:** {buyer or '—'}\n**Seller:** {seller or '—'}"
+
+
+def role_selection_embed(deal):
+    return discord.Embed(
+        title="Select Your Role",
+        description=(
+            "**Buyer** if you are buying or paying for the item.\n"
+            "**Seller** if you are selling or providing the item.\n\n"
+            + role_summary(deal)
+        ),
+        color=discord.Color.blurple()
+    )
+
+
+def role_confirmation_embed(deal):
+    confirmed = deal.get("role_confirmed", {})
+    confirmed_users = [f"<@{uid}>" for uid, ok in confirmed.items() if ok]
+    waiting_users = [f"<@{uid}>" for uid in deal.get("participants", []) if not confirmed.get(uid)]
+    status = "🟢 " + ", ".join(confirmed_users) + " confirmed." if confirmed_users else "🟡 No one has confirmed yet."
+    if waiting_users:
+        status += "\nWaiting for " + ", ".join(waiting_users) + "."
+    return discord.Embed(
+        title="Roles Selected",
+        description=f"{role_summary(deal)}\n\nDouble check before confirming.\n\n{status}",
+        color=discord.Color.blurple()
+    )
 
 
 class MMUserSelect(discord.ui.UserSelect):
@@ -3779,11 +3799,12 @@ class MMUserSelect(discord.ui.UserSelect):
         }
         deal["state"] = "selecting_roles"
         save_mm_deals(_mm_deals)
-        role_embed = discord.Embed(title="Select Your Role", description="**Buyer:** sends or pays for the deal.\n**Seller:** provides the item or receives the payment.\n\nChoose your role below.", color=discord.Color.blurple())
+        role_embed = role_selection_embed(deal)
         try:
             role_msg = await interaction.channel.send(content=f"🟢 {selected.mention} has been added to the ticket.", embed=role_embed, view=MMRoleView(self.deal_id))
             deal["role_message_id"] = str(role_msg.id)
             save_mm_deals(_mm_deals)
+            bot.add_view(MMRoleView(self.deal_id), message_id=role_msg.id)
         except Exception:
             pass
         await interaction.response.send_message("Choose Buyer or Seller in the ticket.", ephemeral=True)
