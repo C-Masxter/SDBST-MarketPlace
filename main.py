@@ -3692,16 +3692,14 @@ class MMRoleView(discord.ui.View):
 
 
 class MMRoleDecisionButton(discord.ui.Button):
-    def __init__(self, deal_id, correct=True, user_id=None):
-        target = str(user_id) if correct and user_id is not None else "all"
+    def __init__(self, deal_id, correct=True):
         super().__init__(
             label="Correct" if correct else "Incorrect",
             style=discord.ButtonStyle.success if correct else discord.ButtonStyle.danger,
-            custom_id=f"mm:role_decision:{deal_id}:{int(correct)}:{target}"
+            custom_id=f"mm:role_decision:{deal_id}:{int(correct)}"
         )
         self.deal_id = deal_id
         self.correct = correct
-        self.user_id = str(user_id) if user_id is not None else None
 
     async def callback(self, interaction):
         deal = _mm_deals.get(self.deal_id)
@@ -3709,9 +3707,6 @@ class MMRoleDecisionButton(discord.ui.Button):
         actor_id = str(interaction.user.id)
         if not deal or actor_id not in participant_ids:
             await safe_error(interaction, "❌ Only the two participants can confirm the roles.")
-            return
-        if self.correct and self.user_id is not None and actor_id != self.user_id:
-            await safe_error(interaction, "❌ Use the Correct button assigned to you.")
             return
         if not self.correct:
             deal["roles"] = {}
@@ -3781,16 +3776,10 @@ class MMOfferEntryView(discord.ui.View):
 class MMRoleConfirmView(discord.ui.View):
     def __init__(self, deal_id):
         super().__init__(timeout=None)
-        deal = _mm_deals.get(deal_id, {})
-        participants = [str(uid) for uid in deal.get("participants", [])]
-        confirmed = {str(uid): bool(value) for uid, value in deal.get("role_confirmed", {}).items()}
-        for uid in participants:
-            name = str(deal.get("names", {}).get(uid, uid))[:65]
-            button = MMRoleDecisionButton(deal_id, True, uid)
-            button.label = f"{name} Confirmed" if confirmed.get(uid, False) else f"{name} Correct"
-            if confirmed.get(uid, False):
-                button.style = discord.ButtonStyle.primary
-            self.add_item(button)
+        # One shared Correct control is intentional. The callback identifies
+        # the actual Discord user who clicked it, so either participant can
+        # click the same button in sequence without targeting the other user.
+        self.add_item(MMRoleDecisionButton(deal_id, True))
         self.add_item(MMRoleDecisionButton(deal_id, False))
 
 
