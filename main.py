@@ -3721,7 +3721,13 @@ class MMRoleDecisionButton(discord.ui.Button):
             await interaction.response.edit_message(embed=role_selection_embed(deal), view=MMRoleView(self.deal_id))
             return
         role_confirmed = {str(uid): bool(value) for uid, value in deal.setdefault("role_confirmed", {}).items()}
-        role_confirmed[actor_id] = not bool(role_confirmed.get(actor_id, False))
+        # Confirmation is intentionally idempotent. A repeated/stale Discord
+        # click cannot toggle a confirmed user back to unconfirmed.
+        if role_confirmed.get(actor_id, False):
+            save_mm_deals(_mm_deals)
+            await interaction.response.edit_message(embed=role_confirmation_embed(deal), view=MMRoleConfirmView(self.deal_id))
+            return
+        role_confirmed[actor_id] = True
         deal["role_confirmed"] = role_confirmed
         participants = [str(uid) for uid in deal.get("participants", [])]
         if participants and all(role_confirmed.get(uid, False) for uid in participants):
@@ -3730,19 +3736,16 @@ class MMRoleDecisionButton(discord.ui.Button):
                 await safe_error(interaction, "❌ A Buyer must be selected before entering the offer.")
                 return
             deal["offer_modal_user_id"] = buyer_id
-            if actor_id == buyer_id:
-                deal["state"] = "entering_deal"
-                save_mm_deals(_mm_deals)
-                try:
-                    await interaction.response.send_modal(USDValueModal(self.deal_id))
-                except Exception as e:
-                    print(f"[MM ROLE USD MODAL] deal={self.deal_id}: {e}")
-                    if not interaction.response.is_done():
-                        await interaction.response.send_message("❌ Could not open the offer form. Please click Enter Offer again.", ephemeral=True)
-            else:
-                deal["state"] = "awaiting_offer"
-                save_mm_deals(_mm_deals)
-                await interaction.response.edit_message(embed=role_confirmation_embed(deal), view=MMOfferEntryView(self.deal_id))
+            # Always replace the confirmation message with the offer-entry
+            # message first. This gives both users one stable state transition;
+            # the Buyer then opens the modal from the dedicated button.
+            deal["state"] = "awaiting_offer"
+            save_mm_deals(_mm_deals)
+            await interaction.response.edit_message(embed=role_confirmation_embed(deal), view=MMOfferEntryView(self.deal_id))
+            try:
+                await interaction.followup.send("🟢 Both participants confirmed. The Buyer can now click Enter Offer / USD Value.", ephemeral=True)
+            except Exception:
+                pass
         else:
             save_mm_deals(_mm_deals)
             await interaction.response.edit_message(embed=role_confirmation_embed(deal), view=MMRoleConfirmView(self.deal_id))
