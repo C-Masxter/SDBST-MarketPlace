@@ -3712,18 +3712,54 @@ class MMRoleDecisionButton(discord.ui.Button):
         role_confirmed = deal.setdefault("role_confirmed", {})
         role_confirmed[str(interaction.user.id)] = not bool(role_confirmed.get(str(interaction.user.id)))
         if all(role_confirmed.get(uid) for uid in deal.get("participants", [])):
-            deal["state"] = "entering_deal"
-            deal["offer_modal_user_id"] = str(interaction.user.id)
-            save_mm_deals(_mm_deals)
-            try:
-                await interaction.response.send_modal(USDValueModal(self.deal_id))
-            except Exception as e:
-                print(f"[MM ROLE USD MODAL] deal={self.deal_id}: {e}")
-                if not interaction.response.is_done():
-                    await interaction.response.send_message("❌ Could not open the offer form. Please click Correct again.", ephemeral=True)
+            buyer_id = next((str(uid) for uid, role in deal.get("roles", {}).items() if role == "buyer"), None)
+            if not buyer_id:
+                await safe_error(interaction, "❌ A Buyer must be selected before entering the offer.")
+                return
+            deal["offer_modal_user_id"] = buyer_id
+            if str(interaction.user.id) == buyer_id:
+                deal["state"] = "entering_deal"
+                save_mm_deals(_mm_deals)
+                try:
+                    await interaction.response.send_modal(USDValueModal(self.deal_id))
+                except Exception as e:
+                    print(f"[MM ROLE USD MODAL] deal={self.deal_id}: {e}")
+                    if not interaction.response.is_done():
+                        await interaction.response.send_message("❌ Could not open the offer form. Please click Enter Offer again.", ephemeral=True)
+            else:
+                deal["state"] = "awaiting_offer"
+                save_mm_deals(_mm_deals)
+                await interaction.response.edit_message(embed=role_confirmation_embed(deal), view=MMOfferEntryView(self.deal_id))
         else:
             save_mm_deals(_mm_deals)
             await interaction.response.edit_message(embed=role_confirmation_embed(deal), view=MMRoleConfirmView(self.deal_id))
+
+
+class MMOfferEntryButton(discord.ui.Button):
+    def __init__(self, deal_id):
+        super().__init__(label="Enter Offer / USD Value", style=discord.ButtonStyle.success, custom_id=f"mm:offer_entry:{deal_id}")
+        self.deal_id = deal_id
+
+    async def callback(self, interaction):
+        deal = _mm_deals.get(self.deal_id)
+        buyer_id = str(deal.get("offer_modal_user_id")) if deal else None
+        if not deal or str(interaction.user.id) != buyer_id:
+            await safe_error(interaction, "❌ Only the Buyer can enter the offer/value.")
+            return
+        deal["state"] = "entering_deal"
+        save_mm_deals(_mm_deals)
+        try:
+            await interaction.response.send_modal(USDValueModal(self.deal_id))
+        except Exception as e:
+            print(f"[MM OFFER BUTTON] deal={self.deal_id}: {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ Could not open the offer form. Please try again.", ephemeral=True)
+
+
+class MMOfferEntryView(discord.ui.View):
+    def __init__(self, deal_id):
+        super().__init__(timeout=None)
+        self.add_item(MMOfferEntryButton(deal_id))
 
 
 class MMRoleConfirmView(discord.ui.View):
@@ -3917,7 +3953,7 @@ class PaymentMethodButton(discord.ui.Button):
     METHODS = {
         "robux": ("Robux", "💎", discord.ButtonStyle.success),
         "paypal": ("PayPal", "💳", discord.ButtonStyle.primary),
-        "crypto": ("Crypto", "₿", discord.ButtonStyle.secondary),
+        "crypto": ("Crypto", "💰", discord.ButtonStyle.secondary),
         "other": ("Other", "🧾", discord.ButtonStyle.secondary),
     }
 
@@ -4360,6 +4396,12 @@ async def restore_mm_views():
                 count += 1
             except Exception as e:
                 print(f"[RESTORE MM ROLE CONFIRM] {e}")
+        if deal.get("role_message_id") and deal.get("state") == "awaiting_offer":
+            try:
+                bot.add_view(MMOfferEntryView(deal_id), message_id=int(deal["role_message_id"]))
+                count += 1
+            except Exception as e:
+                print(f"[RESTORE MM OFFER ENTRY] {e}")
         if deal.get("deal_message_id") and deal.get("state") == "confirming":
             try:
                 bot.add_view(DealConfirmView(deal_id), message_id=int(deal["deal_message_id"]))
