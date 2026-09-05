@@ -3692,32 +3692,45 @@ class MMRoleView(discord.ui.View):
 
 
 class MMRoleDecisionButton(discord.ui.Button):
-    def __init__(self, deal_id, correct=True):
-        super().__init__(label="Correct" if correct else "Incorrect", style=discord.ButtonStyle.success if correct else discord.ButtonStyle.danger, custom_id=f"mm:role_decision:{deal_id}:{int(correct)}")
+    def __init__(self, deal_id, correct=True, user_id=None):
+        target = str(user_id) if correct and user_id is not None else "all"
+        super().__init__(
+            label="Correct" if correct else "Incorrect",
+            style=discord.ButtonStyle.success if correct else discord.ButtonStyle.danger,
+            custom_id=f"mm:role_decision:{deal_id}:{int(correct)}:{target}"
+        )
         self.deal_id = deal_id
         self.correct = correct
+        self.user_id = str(user_id) if user_id is not None else None
 
     async def callback(self, interaction):
         deal = _mm_deals.get(self.deal_id)
-        if not deal or str(interaction.user.id) not in {str(uid) for uid in deal.get("participants", [])}:
+        participant_ids = {str(uid) for uid in deal.get("participants", [])} if deal else set()
+        actor_id = str(interaction.user.id)
+        if not deal or actor_id not in participant_ids:
             await safe_error(interaction, "❌ Only the two participants can confirm the roles.")
+            return
+        if self.correct and self.user_id is not None and actor_id != self.user_id:
+            await safe_error(interaction, "❌ Use the Correct button assigned to you.")
             return
         if not self.correct:
             deal["roles"] = {}
-            deal["role_confirmed"] = {}
+            deal["role_confirmed"] = {str(uid): False for uid in deal.get("participants", [])}
             deal["state"] = "selecting_roles"
             save_mm_deals(_mm_deals)
             await interaction.response.edit_message(embed=role_selection_embed(deal), view=MMRoleView(self.deal_id))
             return
-        role_confirmed = deal.setdefault("role_confirmed", {})
-        role_confirmed[str(interaction.user.id)] = not bool(role_confirmed.get(str(interaction.user.id)))
-        if all(role_confirmed.get(uid) for uid in deal.get("participants", [])):
+        role_confirmed = {str(uid): bool(value) for uid, value in deal.setdefault("role_confirmed", {}).items()}
+        role_confirmed[actor_id] = not bool(role_confirmed.get(actor_id, False))
+        deal["role_confirmed"] = role_confirmed
+        participants = [str(uid) for uid in deal.get("participants", [])]
+        if participants and all(role_confirmed.get(uid, False) for uid in participants):
             buyer_id = next((str(uid) for uid, role in deal.get("roles", {}).items() if role == "buyer"), None)
             if not buyer_id:
                 await safe_error(interaction, "❌ A Buyer must be selected before entering the offer.")
                 return
             deal["offer_modal_user_id"] = buyer_id
-            if str(interaction.user.id) == buyer_id:
+            if actor_id == buyer_id:
                 deal["state"] = "entering_deal"
                 save_mm_deals(_mm_deals)
                 try:
@@ -3765,7 +3778,16 @@ class MMOfferEntryView(discord.ui.View):
 class MMRoleConfirmView(discord.ui.View):
     def __init__(self, deal_id):
         super().__init__(timeout=None)
-        self.add_item(MMRoleDecisionButton(deal_id, True))
+        deal = _mm_deals.get(deal_id, {})
+        participants = [str(uid) for uid in deal.get("participants", [])]
+        confirmed = {str(uid): bool(value) for uid, value in deal.get("role_confirmed", {}).items()}
+        for uid in participants:
+            name = str(deal.get("names", {}).get(uid, uid))[:65]
+            button = MMRoleDecisionButton(deal_id, True, uid)
+            button.label = f"{name} Confirmed" if confirmed.get(uid, False) else f"{name} Correct"
+            if confirmed.get(uid, False):
+                button.style = discord.ButtonStyle.primary
+            self.add_item(button)
         self.add_item(MMRoleDecisionButton(deal_id, False))
 
 
@@ -4288,7 +4310,8 @@ async def mm(interaction: discord.Interaction):
         try:
             member = interaction.guild.get_member(int(raw_id.strip()))
             if member and member.id != interaction.user.id:
-                overwrites[member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+                # Store the configured MM member for later routing, but do not
+                # grant access until both participants confirm the deal/value.
                 tier_members.append(member)
         except (TypeError, ValueError):
             continue
@@ -4297,7 +4320,8 @@ async def mm(interaction: discord.Interaction):
             name=channel_name,
             category=category,
             overwrites=overwrites,
-            topic=f"SDBST Middleman Ticket • {interaction.user}"
+            topic=f"SDBST Middleman Ticket • {interaction.user}",
+            sync_permissions=False
         )
     except discord.Forbidden:
         await interaction.followup.send("❌ I don't have permission to create ticket channels.", ephemeral=True)
