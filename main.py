@@ -3770,12 +3770,15 @@ class MMUserSelect(discord.ui.UserSelect):
         self.deal_id = deal_id
 
     async def callback(self, interaction: discord.Interaction):
+        # Acknowledge before permission edits, persistence, and message sends.
+        # These operations can exceed Discord's interaction deadline.
+        await interaction.response.defer(ephemeral=True)
         deal = _mm_deals.get(self.deal_id)
         if not deal:
-            await safe_error(interaction, "❌ This ticket is no longer active.")
+            await interaction.followup.send("❌ This ticket is no longer active.", ephemeral=True)
             return
         if deal.get("creator_id") and str(interaction.user.id) != deal.get("creator_id"):
-            await safe_error(interaction, "❌ Only the ticket creator can select the user they're dealing with.")
+            await interaction.followup.send("❌ Only the ticket creator can select the user they're dealing with.", ephemeral=True)
             return
         if not deal.get("creator_id"):
             deal["creator_id"] = str(interaction.user.id)
@@ -3807,7 +3810,7 @@ class MMUserSelect(discord.ui.UserSelect):
             bot.add_view(MMRoleView(self.deal_id), message_id=role_msg.id)
         except Exception:
             pass
-        await interaction.response.send_message("Choose Buyer or Seller in the ticket.", ephemeral=True)
+        await interaction.followup.send("Choose Buyer or Seller in the ticket.", ephemeral=True)
 
 
 class MMSelectUserView(discord.ui.View):
