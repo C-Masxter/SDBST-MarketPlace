@@ -4320,8 +4320,7 @@ async def mm(interaction: discord.Interaction):
             name=channel_name,
             category=category,
             overwrites=overwrites,
-            topic=f"SDBST Middleman Ticket • {interaction.user}",
-            sync_permissions=False
+            topic=f"SDBST Middleman Ticket • {interaction.user}"
         )
     except discord.Forbidden:
         await interaction.followup.send("❌ I don't have permission to create ticket channels.", ephemeral=True)
