@@ -683,11 +683,12 @@ async def cached_config_safe(guild_id):
 def mm_deal_embed(deal):
     """Build the deal confirmation card."""
 
+    details = deal.get("deal_details")
     item = deal.get("item") or "—"
     price = deal.get("price") or "—"
     payment = deal.get("payment_method") or "—"
 
-    header = f"{item} | {price} | {payment}"
+    header = "ENTER DEAL DETAILS" if details else f"{item} | {price} | {payment}"
 
     names = deal.get("names", {})
     confirmed = deal.get("confirmed", {})
@@ -699,9 +700,11 @@ def mm_deal_embed(deal):
         status = "🟢 Confirmed" if confirmed.get(uid) else "🟡 Unconfirmed"
         lines.append(f"{name}: {status}")
 
-    description = (
-        f"**{header}**\n\n"
-        + "\n".join(lines)
+    description = f"**{header}**\n\n"
+    if details:
+        description += f"{details}\n\n"
+    description += (
+        "\n".join(lines)
         + "\n\nPlease confirm the trade by pressing the "
         "'Confirm' button below. If this deal is not "
         "accurate, please click 'Edit Deal'"
@@ -3694,9 +3697,13 @@ class MMResetRoleButton(discord.ui.Button):
             await safe_error(interaction, "❌ Only the deal participants can reset roles.")
             return
         deal["roles"] = {}
+        deal.pop("offer_modal_user_id", None)
         deal["state"] = "selecting_roles"
         save_mm_deals(_mm_deals)
-        await interaction.response.edit_message(view=MMRoleView(self.deal_id))
+        await interaction.response.edit_message(
+            embed=role_selection_embed(deal),
+            view=MMRoleView(self.deal_id)
+        )
 
 
 class MMRoleView(discord.ui.View):
@@ -3728,7 +3735,7 @@ class MMRoleView(discord.ui.View):
 
 class MMOfferEntryButton(discord.ui.Button):
     def __init__(self, deal_id):
-        super().__init__(label="Enter Offer / USD Value", style=discord.ButtonStyle.success, custom_id=f"mm:offer_entry:{deal_id}")
+        super().__init__(label="Enter Deal Details", style=discord.ButtonStyle.success, custom_id=f"mm:offer_entry:{deal_id}")
         self.deal_id = deal_id
 
     async def callback(self, interaction):
@@ -3737,14 +3744,23 @@ class MMOfferEntryButton(discord.ui.Button):
         if not deal or str(interaction.user.id) != buyer_id:
             await safe_error(interaction, "❌ Only the Buyer can enter the offer/value.")
             return
-        deal["state"] = "entering_deal"
+        deal["state"] = "awaiting_deal_details"
+        deal["offer_value_user_id"] = str(interaction.user.id)
         save_mm_deals(_mm_deals)
         try:
-            await interaction.response.send_modal(USDValueModal(self.deal_id))
+            await interaction.response.edit_message(
+                embed=role_confirmation_embed(deal),
+                view=None
+            )
+            await interaction.followup.send(
+                "📝 **Enter the deal details in your next message.**\n"
+                "Include everything the Buyer and Seller agreed to (item, price, payment method, and any other terms).",
+                ephemeral=False
+            )
         except Exception as e:
             print(f"[MM OFFER BUTTON] deal={self.deal_id}: {e}")
             if not interaction.response.is_done():
-                await interaction.response.send_message("❌ Could not open the offer form. Please try again.", ephemeral=True)
+                await interaction.response.send_message("❌ Could not start deal entry. Please try again.", ephemeral=True)
 
 
 class MMOfferEntryView(discord.ui.View):
@@ -3872,7 +3888,7 @@ async def route_mm_for_deal(interaction, deal_id, tier):
     mentions = " ".join(member.mention for member in invited) or "the configured MM team"
     claim_embed = discord.Embed(
         title="Middleman Available",
-        description=f"Both users confirmed the deal and value. {mentions}, a middleman can claim this ticket.",
+        description=f"Both users confirmed the deal details. {mentions}, a middleman can claim this ticket.",
         color=discord.Color.green()
     )
     claim_msg = await interaction.channel.send(embed=claim_embed, view=MMClaimView(deal_id))
@@ -4140,9 +4156,18 @@ class MMConfirmButton(discord.ui.Button):
         all_confirmed = all(deal["confirmed"].get(uid) for uid in deal.get("participants", []))
         if all_confirmed:
             try:
-                await interaction.response.send_modal(USDValueModal(self.deal_id))
+                deal["state"] = "routing"
+                save_mm_deals(_mm_deals)
+                await interaction.response.edit_message(
+                    embed=mm_deal_embed(deal),
+                    view=MMRoutingView(self.deal_id)
+                )
+                await interaction.followup.send(
+                    "🟢 Both participants confirmed the deal details. Select the deal range to notify the appropriate middleman team.",
+                    ephemeral=True
+                )
             except Exception as e:
-                print(f"[USD MODAL] {e}")
+                print(f"[MM ROUTING] {e}")
             return
         try:
             await interaction.response.edit_message(embed=embed, view=view)
@@ -4175,7 +4200,22 @@ class MMEditDealButton(discord.ui.Button):
         if str(interaction.user.id) not in {str(uid) for uid in deal.get("participants", [])}:
             await safe_error(interaction, "❌ Only the deal participants can edit the deal.")
             return
-        await interaction.response.send_modal(EnterDealModal(self.deal_id, existing=deal))
+        buyer_id = next(
+            (str(uid) for uid, role in deal.get("roles", {}).items() if role == "buyer"),
+            None
+        )
+        if str(interaction.user.id) != buyer_id:
+            await safe_error(interaction, "❌ Only the Buyer can re-enter the deal details.")
+            return
+        deal["state"] = "awaiting_deal_details"
+        deal["offer_value_user_id"] = buyer_id
+        deal["confirmed"] = {str(uid): False for uid in deal.get("participants", [])}
+        save_mm_deals(_mm_deals)
+        await interaction.response.edit_message(view=None)
+        await interaction.followup.send(
+            "📝 **Enter the updated deal details in your next message.** Include the item, price, payment method, and any other terms.",
+            ephemeral=False
+        )
 
 
 class MMCloseButton(discord.ui.Button):
@@ -4389,6 +4429,12 @@ async def restore_mm_views():
                 count += 1
             except Exception as e:
                 print(f"[RESTORE MM DEAL] {e}")
+        if deal.get("deal_message_id") and deal.get("state") == "routing":
+            try:
+                bot.add_view(MMRoutingView(deal_id), message_id=int(deal["deal_message_id"]))
+                count += 1
+            except Exception as e:
+                print(f"[RESTORE MM ROUTING] {e}")
         if deal.get("usd_message_id") and deal.get("state") == "confirming_usd":
             try:
                 bot.add_view(USDConfirmView(deal_id), message_id=int(deal["usd_message_id"]))
@@ -4892,6 +4938,56 @@ async def on_message(message):
             )
 
         return
+
+    # ----------------------------------------------------
+    # Deal-details entry: after the Buyer presses the button,
+    # capture that participant's next message as the complete
+    # deal instead of opening a modal form.
+    # ----------------------------------------------------
+    if not message.author.bot:
+        pending_deal = next(
+            (
+                deal for deal in _mm_deals.values()
+                if str(deal.get("ticket_channel_id")) == str(message.channel.id)
+                and deal.get("state") == "awaiting_deal_details"
+            ),
+            None
+        )
+        if pending_deal:
+            buyer_id = str(pending_deal.get("offer_value_user_id") or "")
+            if str(message.author.id) == buyer_id:
+                details = (message.content or "").strip()
+                if message.attachments:
+                    attachment_text = "\n".join(attachment.url for attachment in message.attachments)
+                    details = f"{details}\n{attachment_text}".strip()
+                if not details:
+                    await message.channel.send("❌ Please include the deal details in your message.")
+                    return
+                deal_id = next(
+                    deal_id for deal_id, deal in _mm_deals.items()
+                    if deal is pending_deal
+                )
+                pending_deal["deal_details"] = details[:4000]
+                pending_deal["item"] = "Full deal details"
+                pending_deal["price"] = "See deal details"
+                pending_deal["payment_method"] = "See deal details"
+                pending_deal["confirmed"] = {
+                    str(uid): False for uid in pending_deal.get("participants", [])
+                }
+                pending_deal["state"] = "confirming"
+                pending_deal["deal_message_id"] = None
+                save_mm_deals(_mm_deals)
+                deal_message = await message.channel.send(
+                    embed=mm_deal_embed(pending_deal),
+                    view=DealConfirmView(deal_id)
+                )
+                pending_deal["deal_message_id"] = str(deal_message.id)
+                save_mm_deals(_mm_deals)
+                bot.add_view(DealConfirmView(deal_id), message_id=deal_message.id)
+                await message.channel.send(
+                    "🟢 Deal details captured. Both participants must confirm that everything is correct."
+                )
+                return
 
     # Never react to our own sticky note, otherwise
     # the bot would repost itself forever.
