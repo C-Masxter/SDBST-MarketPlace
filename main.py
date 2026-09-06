@@ -712,13 +712,14 @@ def mm_deal_embed(deal):
     header = " | ".join(str(value) for value in (item, price, payment) if value and value != "—") or "Deal details pending"
 
     names = deal.get("names", {})
-    confirmed = deal.get("confirmed", {})
+    confirmed = {str(uid): bool(value) for uid, value in deal.get("confirmed", {}).items()}
 
     lines = []
 
     for uid in deal.get("participants", []):
+        uid = str(uid)
         name = names.get(uid, f"<@{uid}>")
-        status = "🟢 Confirmed" if confirmed.get(uid) else "🟡 Unconfirmed"
+        status = "🟢 Confirmed" if confirmed.get(uid, False) else "🟡 Unconfirmed"
         lines.append(f"{name}: {status}")
 
     description = (
@@ -3592,14 +3593,20 @@ class MMClaimButton(discord.ui.Button):
         self.deal_id = deal_id
 
     async def callback(self, interaction: discord.Interaction):
-        deal = _mm_deals.get(self.deal_id)
-        if not deal:
-            await safe_error(interaction, "❌ This ticket is no longer active.")
-            return
-        if deal.get("claimed_by"):
-            await safe_error(interaction, "❌ This ticket has already been claimed.")
-            return
-        deal["claimed_by"] = str(interaction.user.id)
+        await interaction.response.defer()
+        async with mm_flow_lock(self.deal_id):
+            deal = _mm_deals.get(self.deal_id)
+            if not deal:
+                await interaction.followup.send("❌ This ticket is no longer active.", ephemeral=True)
+                return
+            allowed_ids = {str(uid) for uid in deal.get("tier_member_ids", []) if str(uid).strip()}
+            if str(interaction.user.id) not in allowed_ids:
+                await interaction.followup.send("❌ Only MM members selected for this deal range in `/setup` can claim this ticket.", ephemeral=True)
+                return
+            if deal.get("claimed_by"):
+                await interaction.followup.send("❌ This ticket has already been claimed.", ephemeral=True)
+                return
+            deal["claimed_by"] = str(interaction.user.id)
         save_mm_deals(_mm_deals)
         embed = (
             interaction.message.embeds[0]
@@ -3611,7 +3618,7 @@ class MMClaimButton(discord.ui.Button):
             + f"\n\n🤝 **Claimed by {interaction.user.mention}**"
         )
         try:
-            await interaction.response.edit_message(embed=embed, view=MMClaimView(self.deal_id))
+            await interaction.message.edit(embed=embed, view=MMClaimView(self.deal_id))
         except Exception as e:
             print(f"[MM CLAIM EDIT] {e}")
         try:
@@ -3903,8 +3910,10 @@ async def route_mm_for_deal(interaction, deal_id, tier):
     deal["tier"] = tier
     deal["state"] = "mm_available"
     tier_key = f"mm_tier_members_{tier}"
+    configured_tier_ids = [raw_id.strip() for raw_id in str(config.get(tier_key) or "").split(",") if raw_id.strip()]
+    deal["tier_member_ids"] = configured_tier_ids
     invited = []
-    for raw_id in str(config.get(tier_key) or "").split(","):
+    for raw_id in configured_tier_ids:
         try:
             member = interaction.guild.get_member(int(raw_id.strip()))
             if member and member.id not in {int(x) for x in deal.get("participants", []) if str(x).isdigit()}:
