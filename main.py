@@ -3666,7 +3666,12 @@ class MMRoleButton(discord.ui.Button):
                     view=MMOfferEntryView(self.deal_id)
                 )
             else:
-                await interaction.response.edit_message(view=MMRoleView(self.deal_id))
+                # Refresh the role summary immediately so both participants
+                # can see whose name is assigned to the selected role.
+                await interaction.response.edit_message(
+                    embed=role_selection_embed(deal),
+                    view=MMRoleView(self.deal_id)
+                )
         except Exception as e:
             print(f"[MM ROLE BUTTON] deal={self.deal_id} role={self.role}: {e}")
             try:
@@ -3749,8 +3754,17 @@ class MMOfferEntryView(discord.ui.View):
 
 
 def role_summary(deal):
-    buyer = next((f"<@{uid}>" for uid, role in deal.get("roles", {}).items() if role == "buyer"), "")
-    seller = next((f"<@{uid}>" for uid, role in deal.get("roles", {}).items() if role == "seller"), "")
+    names = deal.get("names", {})
+    buyer = next(
+        (f"{names.get(str(uid), 'Unknown user')} (<@{uid}>)"
+         for uid, role in deal.get("roles", {}).items() if role == "buyer"),
+        ""
+    )
+    seller = next(
+        (f"{names.get(str(uid), 'Unknown user')} (<@{uid}>)"
+         for uid, role in deal.get("roles", {}).items() if role == "seller"),
+        ""
+    )
     return f"**Buyer:** {buyer or '—'}\n**Seller:** {seller or '—'}"
 
 
