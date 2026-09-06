@@ -3632,9 +3632,23 @@ class MMRoleButton(discord.ui.Button):
             deal.setdefault("participants", []).append(str(interaction.user.id))
             deal.setdefault("confirmed", {})[str(interaction.user.id)] = False
             deal.setdefault("names", {})[str(interaction.user.id)] = interaction.user.display_name or interaction.user.name
-        deal.setdefault("roles", {})[str(interaction.user.id)] = self.role
+        roles = deal.setdefault("roles", {})
+        actor_id = str(interaction.user.id)
+        existing_role = roles.get(actor_id)
+        if existing_role:
+            await safe_error(
+                interaction,
+                f"✅ Your role is already locked as **{existing_role.title()}**."
+            )
+            return
+        if self.role in roles.values():
+            await safe_error(
+                interaction,
+                f"❌ **{self.role.title()}** has already been selected by the other participant."
+            )
+            return
+        roles[actor_id] = self.role
         save_mm_deals(_mm_deals)
-        roles = deal.get("roles", {})
         try:
             if len(roles) == 2 and len(set(roles.values())) == 2:
                 # Role selection is the only role check. Do not put users
@@ -3684,8 +3698,16 @@ class MMRoleView(discord.ui.View):
     def __init__(self, deal_id):
         super().__init__(timeout=None)
         self.deal_id = deal_id
-        self.add_item(MMRoleButton(deal_id, "buyer", "Buyer", None))
-        self.add_item(MMRoleButton(deal_id, "seller", "Seller", None))
+        deal = _mm_deals.get(deal_id, {})
+        selected_roles = set(deal.get("roles", {}).values())
+        buyer_button = MMRoleButton(deal_id, "buyer", "Buyer", None)
+        seller_button = MMRoleButton(deal_id, "seller", "Seller", None)
+        # A selected role is visibly locked so users know their click was
+        # registered and cannot keep re-clicking it while waiting.
+        buyer_button.disabled = "buyer" in selected_roles
+        seller_button.disabled = "seller" in selected_roles
+        self.add_item(buyer_button)
+        self.add_item(seller_button)
         self.add_item(MMResetRoleButton(deal_id))
 
     async def on_error(self, interaction, error, item):
