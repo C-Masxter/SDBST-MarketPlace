@@ -3637,11 +3637,20 @@ class MMRoleButton(discord.ui.Button):
         roles = deal.get("roles", {})
         try:
             if len(roles) == 2 and len(set(roles.values())) == 2:
-                deal["role_confirmed"] = {uid: False for uid in deal.get("participants", [])}
-                deal["state"] = "confirming_roles"
+                # Role selection is the only role check. Do not put users
+                # through a second Correct/Incorrect confirmation screen;
+                # once Buyer and Seller are selected, go straight to offer entry.
+                buyer_id = next((str(uid) for uid, role in roles.items() if role == "buyer"), None)
+                if not buyer_id:
+                    await safe_error(interaction, "❌ A Buyer must be selected before entering the offer.")
+                    return
+                deal["offer_modal_user_id"] = buyer_id
+                deal["state"] = "awaiting_offer"
                 save_mm_deals(_mm_deals)
-                embed = discord.Embed(title="Confirm Roles", description=role_summary(deal), color=discord.Color.blurple())
-                await interaction.response.edit_message(embed=embed, view=MMRoleConfirmView(self.deal_id))
+                await interaction.response.edit_message(
+                    embed=role_confirmation_embed(deal),
+                    view=MMOfferEntryView(self.deal_id)
+                )
             else:
                 await interaction.response.edit_message(view=MMRoleView(self.deal_id))
         except Exception as e:
@@ -3666,7 +3675,6 @@ class MMResetRoleButton(discord.ui.Button):
             await safe_error(interaction, "❌ Only the deal participants can reset roles.")
             return
         deal["roles"] = {}
-        deal["role_confirmed"] = {}
         deal["state"] = "selecting_roles"
         save_mm_deals(_mm_deals)
         await interaction.response.edit_message(view=MMRoleView(self.deal_id))
@@ -3689,65 +3697,6 @@ class MMRoleView(discord.ui.View):
                 await interaction.response.send_message("❌ The role button failed. Check the bot console for [MM ROLE VIEW ERROR].", ephemeral=True)
         except Exception:
             pass
-
-
-class MMRoleDecisionButton(discord.ui.Button):
-    def __init__(self, deal_id, correct=True):
-        super().__init__(
-            label="Correct" if correct else "Incorrect",
-            style=discord.ButtonStyle.success if correct else discord.ButtonStyle.danger,
-            custom_id=f"mm:role_decision:{deal_id}:{int(correct)}"
-        )
-        self.deal_id = deal_id
-        self.correct = correct
-
-    async def callback(self, interaction):
-        # Acknowledge immediately. Permission edits, JSON persistence, and
-        # message rendering can otherwise leave the component interaction
-        # pending and cause the other user's button to appear unusable.
-        await interaction.response.defer()
-        deal = _mm_deals.get(self.deal_id)
-        participant_ids = {str(uid) for uid in deal.get("participants", [])} if deal else set()
-        actor_id = str(interaction.user.id)
-        if not deal or actor_id not in participant_ids:
-            await safe_error(interaction, "❌ Only the two participants can confirm the roles.")
-            return
-        if not self.correct:
-            deal["roles"] = {}
-            deal["role_confirmed"] = {str(uid): False for uid in deal.get("participants", [])}
-            deal["state"] = "selecting_roles"
-            save_mm_deals(_mm_deals)
-            await interaction.message.edit(embed=role_selection_embed(deal), view=MMRoleView(self.deal_id))
-            return
-        role_confirmed = {str(uid): bool(value) for uid, value in deal.setdefault("role_confirmed", {}).items()}
-        # Confirmation is intentionally idempotent. A repeated/stale Discord
-        # click cannot toggle a confirmed user back to unconfirmed.
-        if role_confirmed.get(actor_id, False):
-            save_mm_deals(_mm_deals)
-            await interaction.message.edit(embed=role_confirmation_embed(deal), view=MMRoleConfirmView(self.deal_id))
-            return
-        role_confirmed[actor_id] = True
-        deal["role_confirmed"] = role_confirmed
-        participants = [str(uid) for uid in deal.get("participants", [])]
-        if participants and all(role_confirmed.get(uid, False) for uid in participants):
-            buyer_id = next((str(uid) for uid, role in deal.get("roles", {}).items() if role == "buyer"), None)
-            if not buyer_id:
-                await safe_error(interaction, "❌ A Buyer must be selected before entering the offer.")
-                return
-            deal["offer_modal_user_id"] = buyer_id
-            # Always replace the confirmation message with the offer-entry
-            # message first. This gives both users one stable state transition;
-            # the Buyer then opens the modal from the dedicated button.
-            deal["state"] = "awaiting_offer"
-            save_mm_deals(_mm_deals)
-            await interaction.message.edit(embed=role_confirmation_embed(deal), view=MMOfferEntryView(self.deal_id))
-            try:
-                await interaction.followup.send("🟢 Both participants confirmed. The Buyer can now click Enter Offer / USD Value.", ephemeral=True)
-            except Exception:
-                pass
-        else:
-            save_mm_deals(_mm_deals)
-            await interaction.message.edit(embed=role_confirmation_embed(deal), view=MMRoleConfirmView(self.deal_id))
 
 
 class MMOfferEntryButton(discord.ui.Button):
@@ -3777,16 +3726,6 @@ class MMOfferEntryView(discord.ui.View):
         self.add_item(MMOfferEntryButton(deal_id))
 
 
-class MMRoleConfirmView(discord.ui.View):
-    def __init__(self, deal_id):
-        super().__init__(timeout=None)
-        # One shared Correct control is intentional. The callback identifies
-        # the actual Discord user who clicked it, so either participant can
-        # click the same button in sequence without targeting the other user.
-        self.add_item(MMRoleDecisionButton(deal_id, True))
-        self.add_item(MMRoleDecisionButton(deal_id, False))
-
-
 def role_summary(deal):
     buyer = next((f"<@{uid}>" for uid, role in deal.get("roles", {}).items() if role == "buyer"), "")
     seller = next((f"<@{uid}>" for uid, role in deal.get("roles", {}).items() if role == "seller"), "")
@@ -3806,15 +3745,9 @@ def role_selection_embed(deal):
 
 
 def role_confirmation_embed(deal):
-    confirmed = deal.get("role_confirmed", {})
-    confirmed_users = [f"<@{uid}>" for uid, ok in confirmed.items() if ok]
-    waiting_users = [f"<@{uid}>" for uid in deal.get("participants", []) if not confirmed.get(uid)]
-    status = "🟢 " + ", ".join(confirmed_users) + " confirmed." if confirmed_users else "🟡 No one has confirmed yet."
-    if waiting_users:
-        status += "\nWaiting for " + ", ".join(waiting_users) + "."
     return discord.Embed(
         title="Roles Selected",
-        description=f"{role_summary(deal)}\n\nDouble check before confirming.\n\n{status}",
+        description=f"{role_summary(deal)}\n\nRoles selected. The Buyer can now enter the offer/value.",
         color=discord.Color.blurple()
     )
 
@@ -3856,7 +3789,6 @@ class MMUserSelect(discord.ui.UserSelect):
         deal["participants"] = [deal["creator_id"], str(selected.id)]
         deal["confirmed"] = {deal["creator_id"]: False, str(selected.id): False}
         deal["roles"] = {}
-        deal["role_confirmed"] = {}
         deal["names"] = {
             deal["creator_id"]: (interaction.user.display_name or interaction.user.name),
             str(selected.id): (getattr(selected, "display_name", None) or getattr(selected, "name", None) or str(selected))
@@ -4409,12 +4341,6 @@ async def restore_mm_views():
                 count += 1
             except Exception as e:
                 print(f"[RESTORE MM ROLE] {e}")
-        if deal.get("role_message_id") and deal.get("state") == "confirming_roles":
-            try:
-                bot.add_view(MMRoleConfirmView(deal_id), message_id=int(deal["role_message_id"]))
-                count += 1
-            except Exception as e:
-                print(f"[RESTORE MM ROLE CONFIRM] {e}")
         if deal.get("role_message_id") and deal.get("state") == "awaiting_offer":
             try:
                 bot.add_view(MMOfferEntryView(deal_id), message_id=int(deal["role_message_id"]))
