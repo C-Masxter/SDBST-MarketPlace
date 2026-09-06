@@ -3702,6 +3702,10 @@ class MMRoleDecisionButton(discord.ui.Button):
         self.correct = correct
 
     async def callback(self, interaction):
+        # Acknowledge immediately. Permission edits, JSON persistence, and
+        # message rendering can otherwise leave the component interaction
+        # pending and cause the other user's button to appear unusable.
+        await interaction.response.defer()
         deal = _mm_deals.get(self.deal_id)
         participant_ids = {str(uid) for uid in deal.get("participants", [])} if deal else set()
         actor_id = str(interaction.user.id)
@@ -3713,14 +3717,14 @@ class MMRoleDecisionButton(discord.ui.Button):
             deal["role_confirmed"] = {str(uid): False for uid in deal.get("participants", [])}
             deal["state"] = "selecting_roles"
             save_mm_deals(_mm_deals)
-            await interaction.response.edit_message(embed=role_selection_embed(deal), view=MMRoleView(self.deal_id))
+            await interaction.message.edit(embed=role_selection_embed(deal), view=MMRoleView(self.deal_id))
             return
         role_confirmed = {str(uid): bool(value) for uid, value in deal.setdefault("role_confirmed", {}).items()}
         # Confirmation is intentionally idempotent. A repeated/stale Discord
         # click cannot toggle a confirmed user back to unconfirmed.
         if role_confirmed.get(actor_id, False):
             save_mm_deals(_mm_deals)
-            await interaction.response.edit_message(embed=role_confirmation_embed(deal), view=MMRoleConfirmView(self.deal_id))
+            await interaction.message.edit(embed=role_confirmation_embed(deal), view=MMRoleConfirmView(self.deal_id))
             return
         role_confirmed[actor_id] = True
         deal["role_confirmed"] = role_confirmed
@@ -3736,14 +3740,14 @@ class MMRoleDecisionButton(discord.ui.Button):
             # the Buyer then opens the modal from the dedicated button.
             deal["state"] = "awaiting_offer"
             save_mm_deals(_mm_deals)
-            await interaction.response.edit_message(embed=role_confirmation_embed(deal), view=MMOfferEntryView(self.deal_id))
+            await interaction.message.edit(embed=role_confirmation_embed(deal), view=MMOfferEntryView(self.deal_id))
             try:
                 await interaction.followup.send("🟢 Both participants confirmed. The Buyer can now click Enter Offer / USD Value.", ephemeral=True)
             except Exception:
                 pass
         else:
             save_mm_deals(_mm_deals)
-            await interaction.response.edit_message(embed=role_confirmation_embed(deal), view=MMRoleConfirmView(self.deal_id))
+            await interaction.message.edit(embed=role_confirmation_embed(deal), view=MMRoleConfirmView(self.deal_id))
 
 
 class MMOfferEntryButton(discord.ui.Button):
