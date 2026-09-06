@@ -372,7 +372,7 @@ MM_LIGHT_BLUE = discord.Color.from_rgb(110, 190, 255)
 
 async def delayed_mm_ping(channel, content, *, users=False, roles=False):
     """Send a notification after Discord has had time to create/update access."""
-    await asyncio.sleep(1)
+    await asyncio.sleep(1.5)
     try:
         await channel.send(
             content=content,
@@ -3748,7 +3748,7 @@ class MMRoleDecisionButton(discord.ui.Button):
                 deal["state"] = "awaiting_offer"
                 save_mm_deals(_mm_deals)
                 await interaction.message.edit(embed=role_confirmation_embed(deal), view=MMOfferEntryView(self.deal_id))
-                await interaction.followup.send("🟢 Both participants confirmed. The Buyer can now click Enter Offer / USD Value.", ephemeral=True)
+                await interaction.followup.send("🟢 Both participants confirmed. The Buyer can now click Enter Deal.", ephemeral=True)
             else:
                 save_mm_deals(_mm_deals)
                 await interaction.message.edit(embed=role_confirmation_embed(deal), view=MMRoleConfirmView(self.deal_id))
@@ -3756,7 +3756,7 @@ class MMRoleDecisionButton(discord.ui.Button):
 
 class MMOfferEntryButton(discord.ui.Button):
     def __init__(self, deal_id):
-        super().__init__(label="Enter Offer / USD Value", style=discord.ButtonStyle.success, custom_id=f"mm:offer_entry:{deal_id}")
+        super().__init__(label="Enter Deal", style=discord.ButtonStyle.success, custom_id=f"mm:offer_entry:{deal_id}")
         self.deal_id = deal_id
 
     async def callback(self, interaction):
@@ -3939,11 +3939,11 @@ def tier_for_usd(value):
 
 class USDValueModal(discord.ui.Modal):
     def __init__(self, deal_id):
-        super().__init__(title="Confirm USD Deal Value")
+        super().__init__(title="Enter Deal")
         self.deal_id = deal_id
         self.value_input = discord.ui.TextInput(
-            label="Offer / USD Value",
-            placeholder="Example: 105 USD, 500 Robux, or an item",
+            label="Deal Details",
+            placeholder="Example: $105 Zelle for Inverted AWP",
             max_length=100,
             required=True
         )
@@ -3953,18 +3953,22 @@ class USDValueModal(discord.ui.Modal):
         await interaction.response.defer(ephemeral=True)
         try:
             raw = self.value_input.value.strip()
-            value = int(raw)
+            match = re.search(r"(?<!\d)(\d+(?:\.\d+)?)", raw)
+            if not match:
+                raise ValueError
+            value = int(float(match.group(1)))
             if value < 0:
                 raise ValueError
         except ValueError:
-            await interaction.followup.send("❌ Enter a whole USD amount, such as `105`.", ephemeral=True)
+            await interaction.followup.send("❌ Include an integer routing value, such as `$105 Zelle for Inverted AWP`.", ephemeral=True)
             return
         try:
             deal = _mm_deals.get(self.deal_id)
             if not deal:
                 await interaction.followup.send("❌ This deal is no longer active.", ephemeral=True)
                 return
-            deal["price"] = str(value)
+            deal["price"] = raw
+            deal["usd_routing_value"] = value
             deal["usd_confirmed"] = {uid: False for uid in deal.get("participants", [])}
             deal["state"] = "confirming_usd"
             deal["offer_value_user_id"] = str(interaction.user.id)
@@ -3973,7 +3977,7 @@ class USDValueModal(discord.ui.Modal):
             deal["usd_message_id"] = str(msg.id)
             save_mm_deals(_mm_deals)
             bot.add_view(USDConfirmView(self.deal_id), message_id=msg.id)
-            await interaction.followup.send("🟢 Offer posted. Both users must confirm it.", ephemeral=True)
+            await interaction.followup.send("🟢 Deal posted. Both users must confirm it.", ephemeral=True)
         except Exception as e:
             print(f"[MM OFFER SUBMIT] deal={self.deal_id}: {e}")
             await interaction.followup.send("❌ The offer could not be posted. Check the bot console for [MM OFFER SUBMIT].", ephemeral=True)
@@ -4007,39 +4011,66 @@ class PaymentMethodButton(discord.ui.Button):
             print(f"[MM PAYMENT METHOD] {e}")
 
 
-class USDConfirmButton(discord.ui.Button):
-    def __init__(self, deal_id, user_id, confirmed=False):
-        super().__init__(label="USD Confirmed" if confirmed else "Confirm USD", style=discord.ButtonStyle.primary if confirmed else discord.ButtonStyle.success, custom_id=f"mm:usdconfirm:{deal_id}:{user_id}")
+class CancelDealAmountButton(discord.ui.Button):
+    def __init__(self, deal_id):
+        super().__init__(label="Cancel Deal Amount", style=discord.ButtonStyle.danger, custom_id=f"mm:deal_cancel:{deal_id}", row=2)
         self.deal_id = deal_id
-        self.user_id = user_id
 
     async def callback(self, interaction):
-        deal = _mm_deals.get(self.deal_id)
-        if not deal or str(interaction.user.id) != self.user_id:
-            await safe_error(interaction, "❌ You cannot confirm this USD value.")
-            return
-        deal["usd_confirmed"][self.user_id] = not bool(deal["usd_confirmed"].get(self.user_id))
-        save_mm_deals(_mm_deals)
-        all_confirmed = all(deal["usd_confirmed"].get(uid) for uid in deal.get("participants", []))
-        if all_confirmed:
-            tier = tier_for_usd(int(deal["price"]))
-            try:
-                await interaction.response.edit_message(view=None)
+        await interaction.response.defer()
+        async with mm_flow_lock(self.deal_id):
+            deal = _mm_deals.get(self.deal_id)
+            if not deal or str(interaction.user.id) not in {str(uid) for uid in deal.get("participants", [])}:
+                await interaction.followup.send("❌ Only the deal participants can cancel this amount.", ephemeral=True)
+                return
+            deal["price"] = None
+            deal["usd_routing_value"] = None
+            deal["payment_method"] = None
+            deal["usd_confirmed"] = {str(uid): False for uid in deal.get("participants", [])}
+            deal["state"] = "awaiting_offer"
+            save_mm_deals(_mm_deals)
+            await interaction.message.edit(embed=role_confirmation_embed(deal), view=MMOfferEntryView(self.deal_id))
+
+
+class USDConfirmButton(discord.ui.Button):
+    def __init__(self, deal_id):
+        super().__init__(label="Confirm Deal", style=discord.ButtonStyle.success, custom_id=f"mm:deal_confirm:{deal_id}", row=0)
+        self.deal_id = deal_id
+
+    async def callback(self, interaction):
+        await interaction.response.defer()
+        async with mm_flow_lock(self.deal_id):
+            deal = _mm_deals.get(self.deal_id)
+            actor_id = str(interaction.user.id)
+            participant_ids = {str(uid) for uid in deal.get("participants", [])} if deal else set()
+            if not deal or actor_id not in participant_ids:
+                await interaction.followup.send("❌ Only the two participants can confirm this deal.", ephemeral=True)
+                return
+            confirmed = {str(uid): bool(value) for uid, value in deal.setdefault("usd_confirmed", {}).items()}
+            if confirmed.get(actor_id, False):
+                await interaction.message.edit(embed=mm_deal_embed(deal), view=USDConfirmView(self.deal_id))
+                return
+            confirmed[actor_id] = True
+            deal["usd_confirmed"] = confirmed
+            participants = [str(uid) for uid in deal.get("participants", [])]
+            if participants and all(confirmed.get(uid, False) for uid in participants):
+                tier = tier_for_usd(int(deal.get("usd_routing_value") or 0))
+                deal["state"] = "routing_mm"
+                save_mm_deals(_mm_deals)
+                await interaction.message.edit(view=None)
                 await route_mm_for_deal(interaction, self.deal_id, tier)
-            except Exception as e:
-                print(f"[USD ROUTE] {e}")
-            return
-        await interaction.response.edit_message(view=USDConfirmView(self.deal_id))
+            else:
+                save_mm_deals(_mm_deals)
+                await interaction.message.edit(embed=mm_deal_embed(deal), view=USDConfirmView(self.deal_id))
 
 
 class USDConfirmView(discord.ui.View):
     def __init__(self, deal_id):
         super().__init__(timeout=None)
-        deal = _mm_deals.get(deal_id, {})
-        for uid in deal.get("participants", []):
-            self.add_item(USDConfirmButton(deal_id, uid, bool(deal.get("usd_confirmed", {}).get(uid))))
+        self.add_item(USDConfirmButton(deal_id))
         for method in PaymentMethodButton.METHODS:
             self.add_item(PaymentMethodButton(deal_id, method))
+        self.add_item(CancelDealAmountButton(deal_id))
 
 
 class MMRoutingSelect(discord.ui.Select):
