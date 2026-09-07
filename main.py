@@ -816,13 +816,13 @@ def format_ad_text(
     Plain-text ad so the item name is searchable in Discord.
 
         Example:
-        @Azo wants to buy Inverted AWP with offer $105.00, 2K Robux
+        @Azo wants to buy __**Inverted AWP**__ at __**$105.00 USD**__
     """
 
     return (
         f"{mention} "
         f"{ad_action_words(ad_type)} "
-        f"{item} with offer {display_offer(price)}"
+        f"__**{item}**__ at __**{display_offer(price)}**__"
     )
 
 
