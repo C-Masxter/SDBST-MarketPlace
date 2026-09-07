@@ -712,7 +712,7 @@ def mm_deal_embed(deal):
     header = " | ".join(str(value) for value in (item, price, payment) if value and value != "—") or "Deal details pending"
 
     names = deal.get("names", {})
-    confirmed = {str(uid): bool(value) for uid, value in deal.get("confirmed", {}).items()}
+    confirmed = confirmation_map(deal)
 
     lines = []
 
@@ -736,6 +736,23 @@ def mm_deal_embed(deal):
     embed.add_field(name="Buyer", value=f"<@{buyer_id}>" if buyer_id else "—", inline=True)
     embed.add_field(name="Seller", value=f"<@{seller_id}>" if seller_id else "—", inline=True)
     return embed
+
+
+def _as_bool(value):
+    """Convert persisted confirmation values without treating 'false' as true."""
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def confirmation_map(deal, field="confirmed"):
+    """Return confirmation state keyed by normalized participant IDs."""
+    raw = deal.get(field) or {}
+    normalized = {str(uid): _as_bool(value) for uid, value in raw.items()}
+    return {
+        str(uid): normalized.get(str(uid), False)
+        for uid in deal.get("participants", [])
+    }
 
 
 # ============================================================
@@ -3889,7 +3906,20 @@ class MMUserSelect(discord.ui.UserSelect):
             bot.add_view(MMRoleView(self.deal_id), message_id=role_msg.id)
         except Exception:
             pass
-        await interaction.followup.send("Choose Buyer or Seller in the ticket.", ephemeral=True)
+        participant_mentions = " ".join(
+            f"<@{uid}>" for uid in deal.get("participants", [])
+        )
+        await interaction.channel.send(
+            content=(
+                f"{participant_mentions}\n\n"
+                "Choose Buyer or Seller in the ticket."
+            ),
+            allowed_mentions=discord.AllowedMentions(users=True)
+        )
+        await interaction.followup.send(
+            "🟢 Both participants were notified to choose Buyer or Seller.",
+            ephemeral=True
+        )
 
 
 class MMSelectUserView(discord.ui.View):
@@ -4153,7 +4183,7 @@ class EnterDealModal(discord.ui.Modal):
         deal["item"] = self.item_input.value.strip()
         deal["price"] = str(price)
         deal["payment_method"] = self.payment_input.value.strip() or "Not selected"
-        deal["confirmed"] = {uid: False for uid in deal.get("participants", [])}
+        deal["confirmed"] = {str(uid): False for uid in deal.get("participants", [])}
         deal["state"] = "confirming"
         save_mm_deals(_mm_deals)
         embed = mm_deal_embed(deal)
@@ -4181,7 +4211,7 @@ class EnterDealModal(discord.ui.Modal):
                         content=f"**{deal.get('item')} | {money(deal.get('price'))} | {deal.get('payment_method')}**\n"
                         + "\n".join(
                             f"{deal.get('names', {}).get(uid, f'<@{uid}>')}: "
-                            + ("🟢 Confirmed" if deal.get("confirmed", {}).get(uid) else "🟡 Unconfirmed")
+                            + ("🟢 Confirmed" if confirmation_map(deal).get(str(uid), False) else "🟡 Unconfirmed")
                             for uid in deal.get("participants", [])
                         ),
                         view=view
@@ -4211,7 +4241,7 @@ class MMConfirmButton(discord.ui.Button):
             if not deal or actor_id not in participant_ids:
                 await interaction.followup.send("❌ Only the two participants can confirm this deal.", ephemeral=True)
                 return
-            confirmed = {str(uid): bool(value) for uid, value in deal.setdefault("confirmed", {}).items()}
+            confirmed = confirmation_map(deal)
             confirmed[actor_id] = True
             deal["confirmed"] = confirmed
             participants = [str(uid) for uid in deal.get("participants", [])]
