@@ -373,7 +373,7 @@ MM_FLOW_DIVIDER = "━━━━━━━━━━━━━━━━━━━━"
 
 def mm_step(step, title, next_step=None):
     """Format a compact, consistent progress header for MM prompts."""
-    text = f"**Step {step}/4 • {title}**"
+    text = f"**Step {step}/5 • {title}**"
     if next_step:
         text += f"\n{MM_FLOW_DIVIDER}\n**Next:** {next_step}"
     return text
@@ -389,6 +389,19 @@ async def delayed_mm_ping(channel, content, *, users=False, roles=False, delay=1
         )
     except Exception as e:
         print(f"[MM DELAYED PING] {e}")
+
+
+async def temporary_mm_ping(channel, content, *, delay=3.0):
+    """Ping a participant once, then remove the ping message for a clean ticket."""
+    try:
+        ping_message = await channel.send(
+            content=content,
+            allowed_mentions=discord.AllowedMentions(users=True)
+        )
+        await asyncio.sleep(delay)
+        await ping_message.delete()
+    except Exception as e:
+        print(f"[MM TEMP PING] {e}")
 
 
 # ============================================================
@@ -721,7 +734,8 @@ def mm_deal_embed(deal):
     header = " | ".join(str(value) for value in (item, price, payment) if value and value != "—") or "Deal details pending"
 
     names = deal.get("names", {})
-    confirmed = confirmation_map(deal)
+    confirmation_field = "usd_confirmed" if deal.get("state") == "confirming_usd" else "confirmed"
+    confirmed = confirmation_map(deal, confirmation_field)
 
     lines = []
 
@@ -731,8 +745,14 @@ def mm_deal_embed(deal):
         status = "🟢 Confirmed" if confirmed.get(uid, False) else "🟡 Unconfirmed"
         lines.append(f"{name}: {status}")
 
+    progress = (
+        mm_step(5, "Confirm the deal", "Both traders press Confirm Deal to finish.")
+        if deal.get("state") == "confirming_usd"
+        else None
+    )
     description = (
-        f"**{header}**\n\n"
+        ((progress + "\n\n") if progress else "")
+        + f"**{header}**\n\n"
         + "\n".join(lines)
         + "\n\nPlease confirm the trade by pressing the "
         "'Confirm' button below. If this deal is not "
@@ -741,7 +761,8 @@ def mm_deal_embed(deal):
 
     buyer_id = next((str(uid) for uid, role in deal.get("roles", {}).items() if role == "buyer"), None)
     seller_id = next((str(uid) for uid, role in deal.get("roles", {}).items() if role == "seller"), None)
-    embed = discord.Embed(title="ENTER DEAL DETAILS", description=description, color=MM_LIGHT_BLUE)
+    embed_title = "🟦 Step 5/5 • Confirm Deal" if deal.get("state") == "confirming_usd" else "ENTER DEAL DETAILS"
+    embed = discord.Embed(title=embed_title, description=description, color=MM_LIGHT_BLUE)
     embed.add_field(name="Buyer", value=f"<@{buyer_id}>" if buyer_id else "—", inline=True)
     embed.add_field(name="Seller", value=f"<@{seller_id}>" if seller_id else "—", inline=True)
     return embed
@@ -794,14 +815,14 @@ def format_ad_text(
     """
     Plain-text ad so the item name is searchable in Discord.
 
-    Example:
-        @Azo wants to buy Inverted AWP at $105.00
+        Example:
+        @Azo wants to buy Inverted AWP with offer $105.00, 2K Robux
     """
 
     return (
         f"{mention} "
         f"{ad_action_words(ad_type)} "
-        f"{item} | {display_offer(price)} |"
+        f"{item} with offer {display_offer(price)}"
     )
 
 
@@ -3012,6 +3033,7 @@ class AdButtons(discord.ui.View):
                 content=(
                     f"{seller.mention} "
                     f"{interaction.user.mention}\n\n"
+                    f"🔔 Negotiation channel created: {ticket_channel.mention}\n"
                     f"💬 You can negotiate the deal privately here in this ticket.\n\n"
 
                     f"🎫 **Trade ticket opened**\n"
@@ -3345,7 +3367,7 @@ class AdModal(discord.ui.Modal):
 
         self.price_input = discord.ui.TextInput(
             label="Offer",
-            placeholder="Example: 105.00",
+            placeholder="Example: $105.00, 2K Robux",
             max_length=20,
             required=True
         )
@@ -3699,7 +3721,7 @@ class MMRoleButton(discord.ui.Button):
                 deal["state"] = "confirming_roles"
                 save_mm_deals(_mm_deals)
                 embed = discord.Embed(
-                    title="✅ Step 3/4 • Confirm Roles",
+                    title="✅ Step 3/5 • Confirm Roles",
                     description=(
                         mm_step(3, "Confirm Buyer / Seller", "Both traders press Correct to continue.")
                         + "\n\n" + role_summary(deal)
@@ -3790,7 +3812,7 @@ class MMRoleDecisionButton(discord.ui.Button):
                 deal["state"] = "awaiting_offer"
                 save_mm_deals(_mm_deals)
                 next_embed = role_confirmation_embed(deal)
-                next_embed.title = "📝 Step 4/4 • Enter Deal Details"
+                next_embed.title = "📝 Step 4/5 • Enter Deal Details"
                 next_embed.description = (
                     mm_step(4, "Enter deal details", "The Buyer clicks Enter Deal and fills in the trade information.")
                     + "\n\n" + role_summary(deal)
@@ -3847,7 +3869,7 @@ def role_summary(deal):
 
 def role_selection_embed(deal):
     return discord.Embed(
-        title="🧭 Step 2/4 • Choose Buyer or Seller",
+        title="🧭 Step 2/5 • Choose Buyer or Seller",
         description=(
             mm_step(2, "Choose your role", "Both traders select Buyer or Seller below.")
             + "\n\n"
@@ -3867,7 +3889,7 @@ def role_confirmation_embed(deal):
     if waiting_users:
         status += "\nWaiting for " + ", ".join(waiting_users) + "."
     return discord.Embed(
-        title="✅ Step 3/4 • Confirm Roles",
+        title="✅ Step 3/5 • Confirm Roles",
         description=(
             mm_step(3, "Confirm Buyer / Seller", "Both traders press Correct to continue.")
             + f"\n\n{role_summary(deal)}\n\n"
@@ -3925,11 +3947,11 @@ class MMUserSelect(discord.ui.UserSelect):
         role_embed = role_selection_embed(deal)
         try:
             role_msg = await interaction.channel.send(
-                content=f"{interaction.user.mention} {selected.mention}",
                 embed=role_embed,
                 view=MMRoleView(self.deal_id),
                 allowed_mentions=discord.AllowedMentions(users=True)
             )
+            asyncio.create_task(temporary_mm_ping(interaction.channel, selected.mention))
             deal["role_message_id"] = str(role_msg.id)
             save_mm_deals(_mm_deals)
             bot.add_view(MMRoleView(self.deal_id), message_id=role_msg.id)
@@ -4014,7 +4036,7 @@ class USDValueModal(discord.ui.Modal):
         self.deal_id = deal_id
         self.value_input = discord.ui.TextInput(
             label="Deal Details",
-            placeholder="Example: $105 Zelle for Inverted AWP",
+            placeholder="Example: $105.00, 2K Robux",
             max_length=100,
             required=True
         )
@@ -4031,7 +4053,7 @@ class USDValueModal(discord.ui.Modal):
             if value < 0:
                 raise ValueError
         except ValueError:
-            await interaction.followup.send("❌ Include an integer routing value, such as `$105 Zelle for Inverted AWP`.", ephemeral=True)
+            await interaction.followup.send("❌ Include a dollar value, such as `$105.00, 2K Robux`.", ephemeral=True)
             return
         try:
             deal = _mm_deals.get(self.deal_id)
@@ -4428,7 +4450,7 @@ async def mm(interaction: discord.Interaction):
         title="🤝 Middleman Trade Setup",
         description=(
             mm_step(1, "Choose the other trader", "Select the person you are trading with below.")
-            + "\n\nSearch their username in the dropdown, then continue to the role step."
+            + "\n\nSearch up another user's username in the search box and select them from the drop-down."
         ),
         color=MM_LIGHT_BLUE
     )
@@ -4457,7 +4479,7 @@ async def mm(interaction: discord.Interaction):
     }
     save_mm_deals(_mm_deals)
     if select_msg:
-        await interaction.followup.send(f"🤝 MM ticket opened: {ticket_channel.mention}", ephemeral=True)
+        await interaction.followup.send(f"🔔 Negotiation channel created: {ticket_channel.mention}", ephemeral=True)
     else:
         await interaction.followup.send("⚠️ Ticket created, but the participant selector failed to send.", ephemeral=True)
 
@@ -4889,7 +4911,7 @@ async def on_guild_channel_create(channel):
         title="🤝 Middleman Trade Setup",
         description=(
             mm_step(1, "Choose the other trader", "Select the person you are trading with below.")
-            + "\n\nUse the dropdown, mention them, or enter their user ID."
+            + "\n\nSearch up another user's username in the search box and select them from the drop-down."
         ),
         color=discord.Color.blue()
     )
@@ -5263,22 +5285,7 @@ async def create_trade_ticket(guild, buyer, seller, item, price, ad_id):
     category = guild.get_channel(category_id)
     if not isinstance(category, discord.CategoryChannel):
         return {"ok": False, "error": "❌ The configured ticket category doesn't exist."}
-    try:
-        tickets = await api.list_tickets(guild.id)
-        for ticket in tickets:
-            if ticket.get("status") != "open":
-                continue
-            if str(ticket.get("buyer_id")) == str(buyer.id) and str(ticket.get("seller_id")) == str(seller.id):
-                ex_id = ticket.get("channel_id")
-                if ex_id:
-                    try:
-                        existing = guild.get_channel(int(ex_id))
-                    except (TypeError, ValueError):
-                        existing = None
-                    if existing:
-                        return {"ok": False, "error": f"❌ You already have a ticket: {existing.mention}"}
-    except Exception as e:
-        print(f"[TICKET CHECK] {e}")
+    # Multiple WTB/WTS trade tickets between the same users are allowed.
     ticket_name = ticket_channel_name(buyer, seller)
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
