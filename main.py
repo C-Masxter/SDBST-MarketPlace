@@ -3066,19 +3066,8 @@ class AdButtons(discord.ui.View):
                 f"[TICKET MESSAGE] {e}"
             )
 
-        # A clean clickable link straight to the ticket.
-
-        if ticket_message is not None:
-            ticket_link = ticket_message.jump_url
-
-        else:
-            ticket_link = (
-                f"https://discord.com/channels/"
-                f"{guild.id}/{ticket_channel.id}"
-            )
-
         await interaction.followup.send(
-            f"[Click here to open a ticket ✔️]({ticket_link})",
+            f"🔔 Negotiation channel created: {ticket_channel.mention}",
             ephemeral=True
         )
 
