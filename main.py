@@ -3977,12 +3977,23 @@ async def route_mm_for_deal(interaction, deal_id, tier):
         description=f"Both users confirmed the deal and value. {mentions}, a middleman can claim this ticket.",
         color=MM_LIGHT_BLUE
     )
-    claim_msg = await interaction.channel.send(embed=claim_embed, view=MMClaimView(deal_id))
-    if invited:
-        asyncio.create_task(delayed_mm_ping(interaction.channel, " ".join(member.mention for member in invited), users=True))
+    participant_mentions = " ".join(f"<@{uid}>" for uid in deal.get("participants", []))
+    team_mentions = " ".join(member.mention for member in invited)
+    public_status = (
+        f"{participant_mentions}\n\n"
+        "🟢 Both users confirmed. The deal-range MM team has been invited and can now claim the ticket."
+    )
+    if team_mentions:
+        public_status += f"\n{team_mentions}"
+    claim_msg = await interaction.channel.send(
+        content=public_status,
+        embed=claim_embed,
+        view=MMClaimView(deal_id),
+        allowed_mentions=discord.AllowedMentions(users=True)
+    )
     deal["claim_message_id"] = str(claim_msg.id)
     save_mm_deals(_mm_deals)
-    await interaction.followup.send("🟢 Both users confirmed. The deal-range MM team has been invited and can now claim the ticket.", ephemeral=True)
+    await interaction.followup.send("🟢 The confirmation update was posted in the ticket for both participants.", ephemeral=True)
 
 
 def tier_for_usd(value):
@@ -4033,11 +4044,17 @@ class USDValueModal(discord.ui.Modal):
             deal["state"] = "confirming_usd"
             deal["offer_value_user_id"] = str(interaction.user.id)
             save_mm_deals(_mm_deals)
-            msg = await interaction.channel.send(embed=mm_deal_embed(deal), view=USDConfirmView(self.deal_id))
+            participant_mentions = " ".join(f"<@{uid}>" for uid in deal.get("participants", []))
+            msg = await interaction.channel.send(
+                content=f"{participant_mentions}\n\n🟢 Deal posted. Both users must confirm it.",
+                embed=mm_deal_embed(deal),
+                view=USDConfirmView(self.deal_id),
+                allowed_mentions=discord.AllowedMentions(users=True)
+            )
             deal["usd_message_id"] = str(msg.id)
             save_mm_deals(_mm_deals)
             bot.add_view(USDConfirmView(self.deal_id), message_id=msg.id)
-            await interaction.followup.send("🟢 Deal posted. Both users must confirm it.", ephemeral=True)
+            await interaction.followup.send("✅ Deal card posted in the ticket.", ephemeral=True)
         except Exception as e:
             print(f"[MM OFFER SUBMIT] deal={self.deal_id}: {e}")
             await interaction.followup.send("❌ The offer could not be posted. Check the bot console for [MM OFFER SUBMIT].", ephemeral=True)
@@ -4440,7 +4457,6 @@ async def mm(interaction: discord.Interaction):
     }
     save_mm_deals(_mm_deals)
     if select_msg:
-        asyncio.create_task(delayed_mm_ping(ticket_channel, interaction.user.mention, users=True, delay=3.0))
         await interaction.followup.send(f"🤝 MM ticket opened: {ticket_channel.mention}", ephemeral=True)
     else:
         await interaction.followup.send("⚠️ Ticket created, but the participant selector failed to send.", ephemeral=True)
