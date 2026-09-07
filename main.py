@@ -368,6 +368,15 @@ def mm_flow_lock(deal_id):
 
 
 MM_LIGHT_BLUE = discord.Color.from_rgb(110, 190, 255)
+MM_FLOW_DIVIDER = "━━━━━━━━━━━━━━━━━━━━"
+
+
+def mm_step(step, title, next_step=None):
+    """Format a compact, consistent progress header for MM prompts."""
+    text = f"**Step {step}/4 • {title}**"
+    if next_step:
+        text += f"\n{MM_FLOW_DIVIDER}\n**Next:** {next_step}"
+    return text
 
 
 async def delayed_mm_ping(channel, content, *, users=False, roles=False, delay=1.5):
@@ -3689,7 +3698,14 @@ class MMRoleButton(discord.ui.Button):
                 deal["role_confirmed"] = {uid: False for uid in participants}
                 deal["state"] = "confirming_roles"
                 save_mm_deals(_mm_deals)
-                embed = discord.Embed(title="Confirm Buyer / Seller", description=role_summary(deal), color=MM_LIGHT_BLUE)
+                embed = discord.Embed(
+                    title="✅ Step 3/4 • Confirm Roles",
+                    description=(
+                        mm_step(3, "Confirm Buyer / Seller", "Both traders press Correct to continue.")
+                        + "\n\n" + role_summary(deal)
+                    ),
+                    color=MM_LIGHT_BLUE
+                )
                 await interaction.message.edit(embed=embed, view=MMRoleConfirmView(self.deal_id))
             else:
                 deal["state"] = "selecting_roles"
@@ -3773,8 +3789,14 @@ class MMRoleDecisionButton(discord.ui.Button):
                 deal["offer_modal_user_id"] = buyer_id
                 deal["state"] = "awaiting_offer"
                 save_mm_deals(_mm_deals)
-                await interaction.message.edit(embed=role_confirmation_embed(deal), view=MMOfferEntryView(self.deal_id))
-                await interaction.followup.send("🟢 Both participants confirmed. The Buyer can now click Enter Deal.", ephemeral=True)
+                next_embed = role_confirmation_embed(deal)
+                next_embed.title = "📝 Step 4/4 • Enter Deal Details"
+                next_embed.description = (
+                    mm_step(4, "Enter deal details", "The Buyer clicks Enter Deal and fills in the trade information.")
+                    + "\n\n" + role_summary(deal)
+                )
+                await interaction.message.edit(embed=next_embed, view=MMOfferEntryView(self.deal_id))
+                await interaction.followup.send("🟢 Step 4 started: the Buyer can click Enter Deal.", ephemeral=True)
             else:
                 save_mm_deals(_mm_deals)
                 await interaction.message.edit(embed=role_confirmation_embed(deal), view=MMRoleConfirmView(self.deal_id))
@@ -3825,8 +3847,10 @@ def role_summary(deal):
 
 def role_selection_embed(deal):
     return discord.Embed(
-        title="Choose Buyer or Seller",
+        title="🧭 Step 2/4 • Choose Buyer or Seller",
         description=(
+            mm_step(2, "Choose your role", "Both traders select Buyer or Seller below.")
+            + "\n\n"
             "**Buyer** if you are buying or paying for the item.\n"
             "**Seller** if you are selling or providing the item.\n\n"
             + role_summary(deal)
@@ -3843,9 +3867,10 @@ def role_confirmation_embed(deal):
     if waiting_users:
         status += "\nWaiting for " + ", ".join(waiting_users) + "."
     return discord.Embed(
-        title="Confirm Buyer / Seller",
+        title="✅ Step 3/4 • Confirm Roles",
         description=(
-            f"{role_summary(deal)}\n\n"
+            mm_step(3, "Confirm Buyer / Seller", "Both traders press Correct to continue.")
+            + f"\n\n{role_summary(deal)}\n\n"
             "Please confirm that the Buyer and Seller roles are correct.\n\n"
             f"{status}"
         ),
@@ -3899,25 +3924,19 @@ class MMUserSelect(discord.ui.UserSelect):
         save_mm_deals(_mm_deals)
         role_embed = role_selection_embed(deal)
         try:
-            role_msg = await interaction.channel.send(content="🟢 The participant has been added to the ticket.", embed=role_embed, view=MMRoleView(self.deal_id))
-            asyncio.create_task(delayed_mm_ping(interaction.channel, selected.mention, users=True))
+            role_msg = await interaction.channel.send(
+                content=f"{interaction.user.mention} {selected.mention}",
+                embed=role_embed,
+                view=MMRoleView(self.deal_id),
+                allowed_mentions=discord.AllowedMentions(users=True)
+            )
             deal["role_message_id"] = str(role_msg.id)
             save_mm_deals(_mm_deals)
             bot.add_view(MMRoleView(self.deal_id), message_id=role_msg.id)
         except Exception:
             pass
-        participant_mentions = " ".join(
-            f"<@{uid}>" for uid in deal.get("participants", [])
-        )
-        await interaction.channel.send(
-            content=(
-                f"{participant_mentions}\n\n"
-                "Choose Buyer or Seller in the ticket."
-            ),
-            allowed_mentions=discord.AllowedMentions(users=True)
-        )
         await interaction.followup.send(
-            "🟢 Both participants were notified to choose Buyer or Seller.",
+            "🟢 Step 2 started: both participants can now choose Buyer or Seller in the ticket.",
             ephemeral=True
         )
 
@@ -4389,10 +4408,10 @@ async def mm(interaction: discord.Interaction):
     deal_id = uuid.uuid4().hex[:8]
     claim_msg = None
     select_embed = discord.Embed(
-        title="Who are you dealing with?",
+        title="🤝 Middleman Trade Setup",
         description=(
-            "Please search the other user's username in the search box "
-            "and select them from the drop-down."
+            mm_step(1, "Choose the other trader", "Select the person you are trading with below.")
+            + "\n\nSearch their username in the dropdown, then continue to the role step."
         ),
         color=MM_LIGHT_BLUE
     )
@@ -4851,10 +4870,10 @@ async def on_guild_channel_create(channel):
     deal_id = uuid.uuid4().hex[:8]
 
     select_embed = discord.Embed(
+        title="🤝 Middleman Trade Setup",
         description=(
-            "**Who are you dealing with?**\n"
-            "Please select from the dropdown, "
-            "ping them, or type their user ID."
+            mm_step(1, "Choose the other trader", "Select the person you are trading with below.")
+            + "\n\nUse the dropdown, mention them, or enter their user ID."
         ),
         color=discord.Color.blue()
     )
