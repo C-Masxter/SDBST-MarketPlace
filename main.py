@@ -1940,7 +1940,7 @@ class TierMembersView(discord.ui.View):
 class TierMembersButton(discord.ui.Button):
     def __init__(self, parent):
         self.parent_view = parent
-        super().__init__(label="Tier Members", emoji="👥", style=discord.ButtonStyle.secondary, row=4)
+        super().__init__(label="Tier Roles", emoji="👥", style=discord.ButtonStyle.secondary, row=4)
 
     async def callback(self, interaction):
         if not interaction.user.guild_permissions.administrator:
@@ -2096,6 +2096,44 @@ class NegotiationLogButton(discord.ui.Button):
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
 
+
+class VouchSettingsModal(discord.ui.Modal):
+    def __init__(self, parent):
+        super().__init__(title="Vouch Settings")
+        self.parent_view = parent
+        self.channel_input = discord.ui.TextInput(label="Vouches channel ID", default=str(parent.config.get("vouches_channel_id") or ""), required=False)
+        self.role_input = discord.ui.TextInput(label="Blacklist role ID", default=str(parent.config.get("blacklist_role_id") or ""), required=False)
+        self.timeout_input = discord.ui.TextInput(label="No-vouch timeout (hours)", default=str(int(parent.config.get("vouch_timeout_seconds") or 86400) // 3600), required=True)
+        self.link_input = discord.ui.TextInput(label="Roblox private-server link", default=str(parent.config.get("roblox_private_server_link") or "https://www.roblox.com/share?code=4467a3deb2306548b3fec0065a4c85f9&type=Server"), required=True)
+        for item in (self.channel_input, self.role_input, self.timeout_input, self.link_input):
+            self.add_item(item)
+
+    async def on_submit(self, interaction):
+        try:
+            hours = max(1, int(self.timeout_input.value.strip()))
+        except ValueError:
+            await safe_error(interaction, "❌ Timeout must be a whole number of hours.")
+            return
+        data = {"vouches_channel_id": self.channel_input.value.strip(), "blacklist_role_id": self.role_input.value.strip(), "vouch_timeout_seconds": str(hours * 3600), "roblox_private_server_link": self.link_input.value.strip()}
+        try:
+            await api.patch_config(interaction.guild.id, data)
+        except Exception as e:
+            print(f"[VOUCH SETUP] {e}")
+            await safe_error(interaction, "❌ Couldn't save vouch settings.")
+            return
+        self.parent_view.config.update(data)
+        await interaction.response.edit_message(embed=self.parent_view.build_embed(), view=self.parent_view)
+
+class VouchSettingsButton(discord.ui.Button):
+    def __init__(self, parent):
+        self.parent_view = parent
+        super().__init__(label="Vouch Settings", emoji="📝", style=discord.ButtonStyle.secondary, row=4)
+    async def callback(self, interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await safe_error(interaction, "❌ Administrator permissions required.")
+            return
+        await interaction.response.send_modal(VouchSettingsModal(self.parent_view))
+
 class SetupView(discord.ui.View):
 
     def __init__(
@@ -2166,6 +2204,10 @@ class SetupView(discord.ui.View):
 
         self.add_item(
             TierMembersButton(self)
+        )
+
+        self.add_item(
+            VouchSettingsButton(self)
         )
 
 
@@ -3614,6 +3656,40 @@ async def wts(
 # MIDDLEMAN (MM) FLOW
 # ============================================================
 
+
+VOUCH_STATE_FILE = Path("vouch_state.json")
+
+def load_vouch_state():
+    if VOUCH_STATE_FILE.exists():
+        try:
+            return json.loads(VOUCH_STATE_FILE.read_text())
+        except Exception as e:
+            print(f"[VOUCH LOAD] {e}")
+    return {}
+
+def save_vouch_state():
+    try:
+        VOUCH_STATE_FILE.write_text(json.dumps(_vouch_state, indent=2))
+    except Exception as e:
+        print(f"[VOUCH SAVE] {e}")
+
+_vouch_state = load_vouch_state()
+
+def current_mm_deal(channel):
+    channel_id = str(getattr(channel, "id", ""))
+    for deal_id, deal in _mm_deals.items():
+        if str(deal.get("ticket_channel_id")) == channel_id:
+            return deal_id, deal
+    return None, None
+
+def mm_staff_or_claimed(interaction, deal):
+    if interaction.user.guild_permissions.administrator or interaction.user.guild_permissions.manage_channels:
+        return True
+    if deal and str(deal.get("claimed_by")) == str(interaction.user.id):
+        return True
+    role_ids = {str(x) for x in (deal or {}).get("tier_role_ids", [])}
+    return bool(role_ids.intersection({str(r.id) for r in getattr(interaction.user, "roles", [])}))
+
 class MMClaimButton(discord.ui.Button):
 
     def __init__(self, deal_id):
@@ -3661,6 +3737,32 @@ class MMClaimButton(discord.ui.Button):
             pass
 
 
+
+class MMUnclaimButton(discord.ui.Button):
+    def __init__(self, deal_id):
+        super().__init__(label="Unclaim", emoji="↩️", style=discord.ButtonStyle.secondary, custom_id=f"mm:unclaim:{deal_id}")
+        self.deal_id = deal_id
+
+    async def callback(self, interaction):
+        await interaction.response.defer()
+        async with mm_flow_lock(self.deal_id):
+            deal = _mm_deals.get(self.deal_id)
+            if not deal or str(deal.get("claimed_by")) != str(interaction.user.id):
+                await interaction.followup.send("❌ Only the MM who claimed this ticket can unclaim it.", ephemeral=True)
+                return
+            deal["claimed_by"] = None
+            deal["state"] = "mm_available"
+            save_mm_deals(_mm_deals)
+            for raw_id in deal.get("tier_role_ids", []):
+                try:
+                    role = interaction.guild.get_role(int(raw_id))
+                    if role:
+                        await interaction.channel.set_permissions(role, view_channel=True, send_messages=True, read_message_history=True)
+                except (TypeError, ValueError, discord.HTTPException):
+                    pass
+            await interaction.message.edit(view=MMClaimView(self.deal_id))
+        await interaction.channel.send(f"↩️ {interaction.user.mention} unclaimed this ticket. Eligible MMs can claim it again.")
+
 class MMClaimView(discord.ui.View):
 
     def __init__(self, deal_id):
@@ -3670,7 +3772,92 @@ class MMClaimView(discord.ui.View):
         deal = _mm_deals.get(deal_id, {})
         claim_button.disabled = bool(deal.get("claimed_by"))
         self.add_item(claim_button)
+        if deal.get("claimed_by"):
+            self.add_item(MMUnclaimButton(deal_id))
 
+
+
+async def mm_command_context(interaction):
+    if interaction.guild is None:
+        await safe_error(interaction, "❌ This command must be used in a server.")
+        return None, None
+    deal_id, deal = current_mm_deal(interaction.channel)
+    if not deal:
+        await safe_error(interaction, "❌ This command can only be used in an MM ticket.")
+        return None, None
+    if not mm_staff_or_claimed(interaction, deal):
+        await safe_error(interaction, "❌ Only staff or the claimed MM can use this command.")
+        return None, None
+    return deal_id, deal
+
+@bot.tree.command(name="add", description="Add a user to the current MM ticket.")
+@app_commands.describe(user="User to add")
+async def add_ticket_user(interaction: discord.Interaction, user: discord.Member):
+    deal_id, deal = await mm_command_context(interaction)
+    if not deal:
+        return
+    await interaction.response.defer(ephemeral=True)
+    await interaction.channel.set_permissions(user, view_channel=True, send_messages=True, read_message_history=True)
+    await interaction.followup.send(f"✅ Added {user.mention} to the ticket.", ephemeral=True)
+
+@bot.tree.command(name="rename", description="Rename the current MM ticket.")
+@app_commands.describe(name="New channel name")
+async def rename_ticket(interaction: discord.Interaction, name: str):
+    deal_id, deal = await mm_command_context(interaction)
+    if not deal:
+        return
+    cleaned = re.sub(r"[^a-z0-9-]", "-", name.lower()).strip("-")[:90]
+    if not cleaned:
+        await safe_error(interaction, "❌ Choose a valid channel name.")
+        return
+    await interaction.response.defer(ephemeral=True)
+    await interaction.channel.edit(name=cleaned)
+    await interaction.followup.send(f"✅ Ticket renamed to `#{cleaned}`.", ephemeral=True)
+
+@bot.tree.command(name="close", description="Close the current MM ticket while keeping it visible to staff.")
+async def close_mm_ticket(interaction: discord.Interaction):
+    deal_id, deal = await mm_command_context(interaction)
+    if not deal:
+        return
+    await interaction.response.defer(ephemeral=True)
+    deal["state"] = "closed"
+    deal["closed_by"] = str(interaction.user.id)
+    save_mm_deals(_mm_deals)
+    _closed_ticket_channels.add(interaction.channel.id)
+    await restrict_closed_ticket_channel(interaction.channel, interaction.guild, deal.get("participants", []))
+    await interaction.channel.send("🔒 This MM ticket is closed. Staff can reopen or delete it later.")
+    await interaction.followup.send("✅ Ticket closed and kept visible to staff.", ephemeral=True)
+
+@bot.tree.command(name="ps", description="Send private-server transfer instructions.")
+@app_commands.describe(seller="Seller to mention")
+async def private_server(interaction: discord.Interaction, seller: discord.Member):
+    deal_id, deal = await mm_command_context(interaction)
+    if not deal:
+        return
+    config = await get_server_config(interaction.guild.id)
+    link = str(config.get("roblox_private_server_link") or "https://www.roblox.com/share?code=4467a3deb2306548b3fec0065a4c85f9&type=Server")
+    await interaction.response.send_message(f"{seller.mention} Join the private server and transfer your items to the Middleman:\n{link}")
+
+@bot.tree.command(name="vouch", description="Complete an MM ticket and request vouches.")
+@app_commands.describe(seller="Seller", buyer="Buyer")
+async def vouch_ticket(interaction: discord.Interaction, seller: discord.Member, buyer: discord.Member):
+    deal_id, deal = await mm_command_context(interaction)
+    if not deal:
+        return
+    config = await get_server_config(interaction.guild.id)
+    vouch_channel_id = config.get("vouches_channel_id")
+    vouch_channel = interaction.guild.get_channel(int(vouch_channel_id)) if vouch_channel_id else None
+    if not vouch_channel:
+        await safe_error(interaction, "❌ Configure the vouches channel in `/setup` first.")
+        return
+    mm = interaction.guild.get_member(int(deal.get("claimed_by"))) if deal.get("claimed_by") else interaction.user
+    amount = deal.get("price") or "the deal amount"
+    await interaction.response.send_message(f"{seller.mention} {buyer.mention}\nThis middleman ticket has been completed.\nPlease leave a vouch for {mm.mention} in {vouch_channel.mention}.\n\nSample vouch format: `Vouch mm {mm.mention} ${amount} deal fast and easy`")
+    timeout = int(config.get("vouch_timeout_seconds") or 86400)
+    _vouch_state[deal_id] = {"deadline": time.time() + timeout, "participants": [str(seller.id), str(buyer.id)], "vouched": [], "blacklisted": [], "blacklist_role_id": str(config.get("blacklist_role_id") or "")}
+    deal["state"] = "completed"
+    save_vouch_state()
+    save_mm_deals(_mm_deals)
 
 class MMRoleButton(discord.ui.Button):
     def __init__(self, deal_id, role, label, emoji):
@@ -4958,6 +5145,22 @@ async def on_message(message):
     config = await cached_config_safe(
         message.guild.id
     )
+    # Count participant vouches in the configured vouches channel.
+    if not message.author.bot and config.get("vouches_channel_id"):
+        try:
+            if message.channel.id == int(config["vouches_channel_id"]):
+                text = (message.content or "").lower()
+                if "vouch" in text:
+                    changed = False
+                    for state in _vouch_state.values():
+                        author_id = str(message.author.id)
+                        if author_id in {str(x) for x in state.get("participants", [])} and author_id not in state.get("vouched", []):
+                            state.setdefault("vouched", []).append(author_id)
+                            changed = True
+                    if changed:
+                        save_vouch_state()
+        except (TypeError, ValueError):
+            pass
     if not message.author.bot and is_negotiation_channel(message.channel, config):
         _ticket_inactivity[str(message.channel.id)] = {
             "last_activity": time.time(),
@@ -5118,6 +5321,29 @@ async def inactivity_monitor():
     while True:
         try:
             now = time.time()
+            # Apply the configured blacklist role when a completed MM ticket
+            # reaches its no-vouch deadline.
+            for deal_id, state in list(_vouch_state.items()):
+                if now < float(state.get("deadline", now)):
+                    continue
+                deal = _mm_deals.get(deal_id, {})
+                guild = bot.get_guild(int(deal.get("guild_id"))) if deal.get("guild_id") else None
+                if guild:
+                    role = guild.get_role(int(state.get("blacklist_role_id"))) if state.get("blacklist_role_id") else None
+                    if role:
+                        for participant_id in state.get("participants", []):
+                            if participant_id in state.get("vouched", []) or participant_id in state.get("blacklisted", []):
+                                continue
+                            member = guild.get_member(int(participant_id))
+                            if member:
+                                try:
+                                    await member.add_roles(role, reason="No vouch after completed MM ticket")
+                                    state.setdefault("blacklisted", []).append(participant_id)
+                                except Exception as e:
+                                    print(f"[VOUCH BLACKLIST] {e}")
+                if not state.get("blacklisted") or set(state.get("blacklisted", [])) >= set(state.get("participants", [])) - set(state.get("vouched", [])):
+                    _vouch_state.pop(deal_id, None)
+                save_vouch_state()
             for channel_id, state in list(_ticket_inactivity.items()):
                 channel = bot.get_channel(int(channel_id))
                 if channel is None:
