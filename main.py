@@ -369,6 +369,7 @@ def mm_flow_lock(deal_id):
 
 MM_LIGHT_BLUE = discord.Color.from_rgb(110, 190, 255)
 MM_FLOW_DIVIDER = "━━━━━━━━━━━━━━━━━━━━"
+MAX_OPEN_TICKETS_PER_USER = 20
 
 
 def mm_step(step, title, next_step=None):
@@ -2824,7 +2825,7 @@ class AdButtons(discord.ui.View):
             return
 
         # ----------------------------------------------------
-        # Duplicate ticket check
+        # Open-ticket limit
         # ----------------------------------------------------
 
         try:
@@ -2833,54 +2834,40 @@ class AdButtons(discord.ui.View):
                 guild.id
             )
 
+            open_ticket_count = 0
             for ticket in tickets:
-
                 if ticket.get("status") != "open":
                     continue
 
-                buyer = str(
-                    ticket.get("buyer_id")
-                )
+                participant_ids = {
+                    str(ticket.get("buyer_id")),
+                    str(ticket.get("seller_id")),
+                }
+                if str(interaction.user.id) not in participant_ids:
+                    continue
 
-                seller_db = str(
-                    ticket.get("seller_id")
-                )
-
-                if (
-                    buyer == str(interaction.user.id)
-                    and seller_db == str(owner_id)
-                ):
-
-                    existing_channel_id = ticket.get(
-                        "channel_id"
+                channel_id = ticket.get("channel_id")
+                try:
+                    existing = (
+                        guild.get_channel(int(channel_id))
+                        if channel_id else None
                     )
+                except (TypeError, ValueError):
+                    existing = None
 
-                    if existing_channel_id:
+                # Only count tickets whose Discord channel still exists.
+                if existing:
+                    open_ticket_count += 1
 
-                        try:
-
-                            existing = guild.get_channel(
-                                int(existing_channel_id)
-                            )
-
-                        except (
-                            TypeError,
-                            ValueError
-                        ):
-
-                            existing = None
-
-                        if existing:
-
-                            await safe_error(
-                                interaction,
-                                (
-                                    "❌ You already have "
-                                    f"a ticket: {existing.mention}"
-                                )
-                            )
-
-                            return
+            if open_ticket_count >= MAX_OPEN_TICKETS_PER_USER:
+                await safe_error(
+                    interaction,
+                    (
+                        f"❌ You already have {MAX_OPEN_TICKETS_PER_USER} "
+                        "open tickets. Close one before creating another."
+                    )
+                )
+                return
 
         except Exception as e:
 
@@ -3788,7 +3775,10 @@ class MMRoleDecisionButton(discord.ui.Button):
                 save_mm_deals(_mm_deals)
                 await interaction.message.edit(embed=role_selection_embed(deal), view=MMRoleView(self.deal_id))
                 return
-            confirmed = {str(uid): bool(value) for uid, value in deal.setdefault("role_confirmed", {}).items()}
+            confirmed = {
+                str(uid): _as_bool(value)
+                for uid, value in deal.setdefault("role_confirmed", {}).items()
+            }
             confirmed[actor_id] = True
             deal["role_confirmed"] = confirmed
             participants = [str(uid) for uid in deal.get("participants", [])]
@@ -3871,9 +3861,9 @@ def role_selection_embed(deal):
 
 
 def role_confirmation_embed(deal):
-    confirmed = deal.get("role_confirmed", {})
-    confirmed_users = [f"<@{uid}>" for uid, ok in confirmed.items() if ok]
-    waiting_users = [f"<@{uid}>" for uid in deal.get("participants", []) if not confirmed.get(uid)]
+    confirmed = confirmation_map(deal, "role_confirmed")
+    confirmed_users = [f"<@{uid}>" for uid in deal.get("participants", []) if confirmed.get(str(uid), False)]
+    waiting_users = [f"<@{uid}>" for uid in deal.get("participants", []) if not confirmed.get(str(uid), False)]
     status = "🟢 " + ", ".join(confirmed_users) + " confirmed." if confirmed_users else "🟡 No one has confirmed yet."
     if waiting_users:
         status += "\nWaiting for " + ", ".join(waiting_users) + "."
@@ -4025,7 +4015,7 @@ class USDValueModal(discord.ui.Modal):
         self.deal_id = deal_id
         self.value_input = discord.ui.TextInput(
             label="Deal Details",
-            placeholder="Example: $105.00, 2K Robux",
+            placeholder="Example: Item, Price, Payment Method",
             max_length=100,
             required=True
         )
@@ -4134,7 +4124,10 @@ class USDConfirmButton(discord.ui.Button):
             if not deal or actor_id not in participant_ids:
                 await interaction.followup.send("❌ Only the two participants can confirm this deal.", ephemeral=True)
                 return
-            confirmed = {str(uid): bool(value) for uid, value in deal.setdefault("usd_confirmed", {}).items()}
+            confirmed = {
+                str(uid): _as_bool(value)
+                for uid, value in deal.setdefault("usd_confirmed", {}).items()
+            }
             if confirmed.get(actor_id, False):
                 await interaction.message.edit(embed=mm_deal_embed(deal), view=USDConfirmView(self.deal_id))
                 return
@@ -4194,21 +4187,21 @@ class EnterDealModal(discord.ui.Modal):
         existing = existing or {}
         self.item_input = discord.ui.TextInput(
             label="Item Name",
-            placeholder="Item being traded",
+            placeholder="Example: Item, Price, Payment Method",
             max_length=100,
             required=True,
             default=str(existing.get("item", ""))
         )
         self.price_input = discord.ui.TextInput(
             label="Offer",
-            placeholder="Example: 50.00",
+            placeholder="Price",
             max_length=20,
             required=True,
             default=str(existing.get("price", ""))
         )
         self.payment_input = discord.ui.TextInput(
             label="Payment Method",
-            placeholder="Example: PayPal, Crypto",
+            placeholder="Payment Method",
             max_length=50,
             required=False,
             default=str(existing.get("payment_method", ""))
@@ -4468,7 +4461,7 @@ async def mm(interaction: discord.Interaction):
     }
     save_mm_deals(_mm_deals)
     if select_msg:
-        await interaction.followup.send(f"🔔 Negotiation channel created: {ticket_channel.mention}", ephemeral=True)
+        await interaction.followup.send(f"🎫 MM ticket created {ticket_channel.mention}", ephemeral=True)
     else:
         await interaction.followup.send("⚠️ Ticket created, but the participant selector failed to send.", ephemeral=True)
 
