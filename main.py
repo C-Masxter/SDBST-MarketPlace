@@ -371,6 +371,56 @@ def mm_flow_lock(deal_id):
 MM_LIGHT_BLUE = discord.Color.from_rgb(110, 190, 255)
 MM_FLOW_DIVIDER = "━━━━━━━━━━━━━━━━━━━━"
 MAX_OPEN_TICKETS_PER_USER = 20
+MM_TICKET_COUNTER_FILE = Path("mm_ticket_counter.json")
+MM_CLAIM_COUNTS_FILE = Path("mm_claim_counts.json")
+
+
+def _load_json_file(path):
+    if path.exists():
+        try:
+            data = json.loads(path.read_text())
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            print(f"[JSON LOAD] {path}: {e}")
+    return {}
+
+
+def _save_json_file(path, data):
+    try:
+        path.write_text(json.dumps(data, indent=2))
+    except Exception as e:
+        print(f"[JSON SAVE] {path}: {e}")
+
+
+_mm_ticket_counters = _load_json_file(MM_TICKET_COUNTER_FILE)
+_mm_claim_counts = _load_json_file(MM_CLAIM_COUNTS_FILE)
+_mm_counter_lock = asyncio.Lock()
+
+
+async def next_mm_ticket_number(guild_id):
+    async with _mm_counter_lock:
+        key = str(guild_id)
+        number = max(int(_mm_ticket_counters.get(key, 8000) or 8000) + 1, 8001)
+        _mm_ticket_counters[key] = number
+        _save_json_file(MM_TICKET_COUNTER_FILE, _mm_ticket_counters)
+        return number
+
+
+def current_claim_month():
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def record_mm_claim(guild_id, user_id):
+    guild_key = str(guild_id)
+    month = current_claim_month()
+    month_data = _mm_claim_counts.setdefault(guild_key, {}).setdefault(month, {})
+    user_key = str(user_id)
+    month_data[user_key] = int(month_data.get(user_key, 0) or 0) + 1
+    _save_json_file(MM_CLAIM_COUNTS_FILE, _mm_claim_counts)
+
+
+def get_mm_claim_counts(guild_id):
+    return _mm_claim_counts.get(str(guild_id), {}).get(current_claim_month(), {})
 
 
 def mm_step(step, title, next_step=None):
@@ -1054,6 +1104,9 @@ class SDBSTBot(commands.Bot):
 
 
 bot = SDBSTBot()
+
+ticket_group = app_commands.Group(name="ticket", description="Ticket statistics and management commands.")
+bot.tree.add_command(ticket_group)
 
 
 # ============================================================
@@ -3758,17 +3811,12 @@ async def create_mm_transcript(interaction, deal):
     try:
         sent = await log_channel.send(
             content=(
-                f"**MM Transcript**\nBuyer: {buyer}\nSeller: {seller}\n"
-                f"MM: {mm}\nDeal: {deal_text}"
+                f"Buyer: {buyer}\nSeller: {seller}\nMM: {mm}\nDeal: {deal_text}\n"
+                f"Transcript link: {filename}"
             ),
             file=discord.File(io.BytesIO(transcript.encode("utf-8")), filename=filename)
         )
         attachment_url = sent.attachments[0].url if sent.attachments else None
-        if attachment_url:
-            await log_channel.send(
-                f"Buyer: {buyer}\nSeller: {seller}\nMM: {mm}\nDeal: {deal_text}\n"
-                f"Transcript link: {attachment_url}"
-            )
         return attachment_url
     except Exception as e:
         print(f"[MM TRANSCRIPT LOG] {e}")
@@ -3857,6 +3905,7 @@ class MMClaimButton(discord.ui.Button):
                 await interaction.followup.send("❌ This ticket has already been claimed.", ephemeral=True)
                 return
             deal["claimed_by"] = str(interaction.user.id)
+            record_mm_claim(interaction.guild.id, interaction.user.id)
         save_mm_deals(_mm_deals)
         embed = (
             interaction.message.embeds[0]
@@ -3914,7 +3963,6 @@ class MMClaimView(discord.ui.View):
         self.add_item(claim_button)
         if deal.get("claimed_by"):
             self.add_item(MMUnclaimButton(deal_id))
-        self.add_item(MMCloseButton(deal_id))
 
 
 
@@ -3963,10 +4011,63 @@ async def close_mm_ticket(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     transcript_url = await create_mm_transcript(interaction, deal)
     await close_mm_deal(interaction, deal_id, deal)
+    _mm_deals.pop(deal_id, None)
+    save_mm_deals(_mm_deals)
+    try:
+        await interaction.channel.delete(reason=f"MM ticket closed by command: {interaction.user}")
+    except Exception as e:
+        print(f"[MM COMMAND DELETE] {e}")
     if transcript_url:
         await interaction.followup.send(f"📄 Transcript logged: {transcript_url}", ephemeral=True)
     else:
         await interaction.followup.send("⚠️ Ticket closed, but no transcript log channel is configured or the transcript could not be uploaded.", ephemeral=True)
+
+
+@ticket_group.command(name="count", description="Show MM tickets claimed this month.")
+async def ticket_count(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await safe_error(interaction, "❌ Use this command in a server.")
+        return
+    counts = get_mm_claim_counts(interaction.guild.id)
+    if not counts:
+        await interaction.response.send_message("📊 No MM tickets have been claimed this month yet.", ephemeral=True)
+        return
+    ranked = sorted(counts.items(), key=lambda item: (-int(item[1]), item[0]))
+    lines = [
+        f"{index}. <@{user_id}> has claimed **{int(total)}** ticket{'s' if int(total) != 1 else ''} this month"
+        for index, (user_id, total) in enumerate(ranked, start=1)
+    ]
+    await interaction.response.send_message(
+        f"📊 **MM claimed-ticket rankings — {current_claim_month()}**\n" + "\n".join(lines)
+    )
+
+
+@ticket_group.command(name="clear", description="Clear MM claimed-ticket counts for this month.")
+@app_commands.checks.has_permissions(administrator=True)
+async def ticket_count_clear(interaction: discord.Interaction):
+    guild_key = str(interaction.guild.id)
+    month = current_claim_month()
+    _mm_claim_counts.setdefault(guild_key, {})[month] = {}
+    _save_json_file(MM_CLAIM_COUNTS_FILE, _mm_claim_counts)
+    await interaction.response.send_message(f"✅ Cleared MM claimed-ticket counts for {month}.", ephemeral=True)
+
+
+@ticket_group.command(name="change", description="Set a user's MM claimed-ticket count for this month.")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(member="User whose count should change", count="New count for this month")
+async def ticket_count_change(interaction: discord.Interaction, member: discord.Member, count: int):
+    if count < 0:
+        await safe_error(interaction, "❌ Count cannot be negative.")
+        return
+    guild_key = str(interaction.guild.id)
+    month = current_claim_month()
+    month_data = _mm_claim_counts.setdefault(guild_key, {}).setdefault(month, {})
+    month_data[str(member.id)] = count
+    _save_json_file(MM_CLAIM_COUNTS_FILE, _mm_claim_counts)
+    await interaction.response.send_message(
+        f"✅ Set {member.mention}'s MM claimed-ticket count to **{count}** for {month}.",
+        ephemeral=True
+    )
 
 @bot.tree.command(name="ps", description="Send private-server transfer instructions.")
 @app_commands.describe(seller="Seller to mention")
@@ -4074,7 +4175,6 @@ class MMRoleView(discord.ui.View):
         self.add_item(MMRoleButton(deal_id, "buyer", "Buyer", None))
         self.add_item(MMRoleButton(deal_id, "seller", "Seller", None))
         self.add_item(MMResetRoleButton(deal_id))
-        self.add_item(MMCloseButton(deal_id))
 
     async def on_error(self, interaction, error, item):
         print(f"[MM ROLE VIEW ERROR] deal={self.deal_id} item={item}: {error}")
@@ -4166,7 +4266,6 @@ class MMOfferEntryView(discord.ui.View):
     def __init__(self, deal_id):
         super().__init__(timeout=None)
         self.add_item(MMOfferEntryButton(deal_id))
-        self.add_item(MMCloseButton(deal_id))
 
 
 class MMRoleConfirmView(discord.ui.View):
@@ -4177,7 +4276,6 @@ class MMRoleConfirmView(discord.ui.View):
         # click the same button in sequence without targeting the other user.
         self.add_item(MMRoleDecisionButton(deal_id, True))
         self.add_item(MMRoleDecisionButton(deal_id, False))
-        self.add_item(MMCloseButton(deal_id))
 
 
 def role_summary(deal):
@@ -4505,7 +4603,6 @@ class USDConfirmView(discord.ui.View):
         super().__init__(timeout=None)
         self.add_item(USDConfirmButton(deal_id))
         self.add_item(MMEditDealButton(deal_id))
-        self.add_item(MMCloseButton(deal_id))
 
 
 class MMRoutingSelect(discord.ui.Select):
@@ -4533,7 +4630,6 @@ class MMRoutingView(discord.ui.View):
     def __init__(self, deal_id):
         super().__init__(timeout=None)
         self.add_item(MMRoutingSelect(deal_id))
-        self.add_item(MMCloseButton(deal_id))
 
 
 class EnterDealModal(discord.ui.Modal):
@@ -4767,7 +4863,6 @@ class DealConfirmView(discord.ui.View):
         self.deal_id = deal_id
         self.add_item(MMConfirmButton(deal_id))
         self.add_item(MMEditDealButton(deal_id))
-        self.add_item(MMCloseButton(deal_id))
 
 
 # ============================================================
@@ -4799,7 +4894,7 @@ async def mm(interaction: discord.Interaction):
         return
     if not interaction.response.is_done():
         await interaction.response.defer(ephemeral=True)
-    ticket_num = random.randint(1000, 9999)
+    ticket_num = await next_mm_ticket_number(interaction.guild.id)
     channel_name = f"need-middleman-{ticket_num}"
     _pending_mm_channels.add(
         (interaction.guild.id, channel_name)
@@ -5379,7 +5474,11 @@ async def on_message(message):
                         save_vouch_state()
         except (TypeError, ValueError):
             pass
-    if not message.author.bot and is_negotiation_channel(message.channel, config):
+    is_mm_channel = any(
+        str(deal.get("ticket_channel_id")) == str(message.channel.id)
+        for deal in _mm_deals.values()
+    )
+    if not message.author.bot and is_negotiation_channel(message.channel, config) and not is_mm_channel:
         _ticket_inactivity[str(message.channel.id)] = {
             "last_activity": time.time(),
             "prompted": False
@@ -5596,7 +5695,11 @@ async def on_message_edit(before, after):
     if after.guild is None:
         return
     config = await cached_config_safe(after.guild.id)
-    if not after.author.bot and is_negotiation_channel(after.channel, config):
+    is_mm_channel = any(
+        str(deal.get("ticket_channel_id")) == str(after.channel.id)
+        for deal in _mm_deals.values()
+    )
+    if not after.author.bot and is_negotiation_channel(after.channel, config) and not is_mm_channel:
         _ticket_inactivity[str(after.channel.id)] = {"last_activity": time.time(), "prompted": False}
         save_inactivity_state()
         _negotiation_message_cache[after.id] = after
@@ -5609,7 +5712,11 @@ async def on_raw_message_delete(payload):
     if message is None or message.guild is None:
         return
     config = await cached_config_safe(message.guild.id)
-    if not is_negotiation_channel(message.channel, config):
+    is_mm_channel = any(
+        str(deal.get("ticket_channel_id")) == str(message.channel.id)
+        for deal in _mm_deals.values()
+    )
+    if is_mm_channel or not is_negotiation_channel(message.channel, config):
         return
     await log_negotiation_event(message, config, "DELETED")
 
