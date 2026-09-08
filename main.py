@@ -735,7 +735,16 @@ def mm_deal_embed(deal):
     header = " | ".join(str(value) for value in (item, price, payment) if value and value != "—") or "Deal details pending"
 
     names = deal.get("names", {})
-    confirmation_field = "usd_confirmed" if deal.get("state") == "confirming_usd" else "confirmed"
+    # The USD confirmation map remains the authoritative map after the
+    # workflow advances to routing/mm_available. Previously the state change
+    # made the renderer fall back to the separate role/deal confirmation map,
+    # causing both users to appear unconfirmed even after both clicked Confirm.
+    confirmation_field = (
+        "usd_confirmed"
+        if deal.get("usd_confirmed") is not None
+        and deal.get("state") in {"confirming_usd", "routing_mm", "mm_available"}
+        else "confirmed"
+    )
     confirmed = confirmation_map(deal, confirmation_field)
 
     lines = []
