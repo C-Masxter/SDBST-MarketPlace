@@ -1779,6 +1779,12 @@ class RequestMMButton(discord.ui.Button):
                 await interaction.followup.send("❌ I couldn't create that MM ticket. Check the bot console for the exact error.", ephemeral=True)
             except Exception:
                 pass
+        finally:
+            # Reset the persistent select so the same range can be chosen again.
+            try:
+                await interaction.message.edit(view=MMPanelView())
+            except Exception as e:
+                print(f"[MM PANEL RESET] {e}")
 
 
 class MMValueTierSelect(discord.ui.Select):
@@ -1804,6 +1810,12 @@ class MMValueTierSelect(discord.ui.Select):
                 await interaction.followup.send("❌ I couldn't create that MM ticket. Check the bot console for the exact error.", ephemeral=True)
             except Exception:
                 pass
+        finally:
+            # Discord keeps a selected option highlighted until the message is edited.
+            try:
+                await interaction.message.edit(view=MMPanelView())
+            except Exception as e:
+                print(f"[MM TIER RESET] {e}")
 
 
 class MMPanelView(discord.ui.View):
@@ -3695,6 +3707,47 @@ def mm_staff_or_claimed(interaction, deal):
     role_ids = {str(x) for x in (deal or {}).get("tier_role_ids", [])}
     return bool(role_ids.intersection({str(r.id) for r in getattr(interaction.user, "roles", [])}))
 
+
+async def close_mm_deal(interaction, deal_id, deal, source_message=None):
+    """Close an MM ticket after the requested five-second delay, without deleting it."""
+    await interaction.response.send_message("🔒 This ticket will close in 5 seconds...", ephemeral=True)
+    await asyncio.sleep(5)
+    current = _mm_deals.get(deal_id)
+    if not current or current.get("state") == "closed":
+        return
+    current["state_before_close"] = current.get("state")
+    current["state"] = "closed"
+    current["closed_by"] = str(interaction.user.id)
+    current["closed_at"] = time.time()
+    _closed_ticket_channels.add(interaction.channel.id)
+    save_mm_deals(_mm_deals)
+    await restrict_closed_ticket_channel(interaction.channel, interaction.guild, current.get("participants", []))
+    # Keep the configured MM/support roles able to see the closed ticket and
+    # use the persistent Reopen button.
+    for raw_role_id in current.get("tier_role_ids", []):
+        try:
+            role = interaction.guild.get_role(int(raw_role_id))
+            if role:
+                await interaction.channel.set_permissions(
+                    role,
+                    view_channel=True,
+                    send_messages=False,
+                    read_message_history=True
+                )
+        except (TypeError, ValueError, discord.HTTPException) as e:
+            print(f"[MM CLOSE STAFF PERMS] {e}")
+    try:
+        message = source_message or interaction.message
+        await message.edit(view=MMClosedView(deal_id))
+        current["closed_message_id"] = str(message.id)
+        save_mm_deals(_mm_deals)
+    except Exception as e:
+        print(f"[MM CLOSE EDIT] {e}")
+    try:
+        await interaction.channel.send("🔒 This MM ticket is closed. An MM or support staff member can reopen it.")
+    except Exception as e:
+        print(f"[MM CLOSE NOTICE] {e}")
+
 class MMClaimButton(discord.ui.Button):
 
     def __init__(self, deal_id):
@@ -3779,6 +3832,7 @@ class MMClaimView(discord.ui.View):
         self.add_item(claim_button)
         if deal.get("claimed_by"):
             self.add_item(MMUnclaimButton(deal_id))
+        self.add_item(MMCloseButton(deal_id))
 
 
 
@@ -3824,14 +3878,13 @@ async def close_mm_ticket(interaction: discord.Interaction):
     deal_id, deal = await mm_command_context(interaction)
     if not deal:
         return
-    await interaction.response.defer(ephemeral=True)
-    deal["state"] = "closed"
-    deal["closed_by"] = str(interaction.user.id)
-    save_mm_deals(_mm_deals)
-    _closed_ticket_channels.add(interaction.channel.id)
-    await restrict_closed_ticket_channel(interaction.channel, interaction.guild, deal.get("participants", []))
-    await interaction.channel.send("🔒 This MM ticket is closed. Staff can reopen or delete it later.")
-    await interaction.followup.send("✅ Ticket closed and kept visible to staff.", ephemeral=True)
+    allowed_participants = {str(uid) for uid in deal.get("participants", [])}
+    if deal.get("creator_id"):
+        allowed_participants.add(str(deal["creator_id"]))
+    if str(interaction.user.id) not in allowed_participants:
+        await safe_error(interaction, "❌ Only the two participants can close this MM ticket.")
+        return
+    await close_mm_deal(interaction, deal_id, deal)
 
 @bot.tree.command(name="ps", description="Send private-server transfer instructions.")
 @app_commands.describe(seller="Seller to mention")
@@ -3939,6 +3992,7 @@ class MMRoleView(discord.ui.View):
         self.add_item(MMRoleButton(deal_id, "buyer", "Buyer", None))
         self.add_item(MMRoleButton(deal_id, "seller", "Seller", None))
         self.add_item(MMResetRoleButton(deal_id))
+        self.add_item(MMCloseButton(deal_id))
 
     async def on_error(self, interaction, error, item):
         print(f"[MM ROLE VIEW ERROR] deal={self.deal_id} item={item}: {error}")
@@ -4030,6 +4084,7 @@ class MMOfferEntryView(discord.ui.View):
     def __init__(self, deal_id):
         super().__init__(timeout=None)
         self.add_item(MMOfferEntryButton(deal_id))
+        self.add_item(MMCloseButton(deal_id))
 
 
 class MMRoleConfirmView(discord.ui.View):
@@ -4040,6 +4095,7 @@ class MMRoleConfirmView(discord.ui.View):
         # click the same button in sequence without targeting the other user.
         self.add_item(MMRoleDecisionButton(deal_id, True))
         self.add_item(MMRoleDecisionButton(deal_id, False))
+        self.add_item(MMCloseButton(deal_id))
 
 
 def role_summary(deal):
@@ -4367,6 +4423,7 @@ class USDConfirmView(discord.ui.View):
         super().__init__(timeout=None)
         self.add_item(USDConfirmButton(deal_id))
         self.add_item(MMEditDealButton(deal_id))
+        self.add_item(MMCloseButton(deal_id))
 
 
 class MMRoutingSelect(discord.ui.Select):
@@ -4394,6 +4451,7 @@ class MMRoutingView(discord.ui.View):
     def __init__(self, deal_id):
         super().__init__(timeout=None)
         self.add_item(MMRoutingSelect(deal_id))
+        self.add_item(MMCloseButton(deal_id))
 
 
 class EnterDealModal(discord.ui.Modal):
@@ -4560,16 +4618,65 @@ class MMCloseButton(discord.ui.Button):
         if not deal:
             await safe_error(interaction, "❌ This ticket is no longer active.")
             return
-        if str(interaction.user.id) != deal.get("creator_id"):
-            await safe_error(interaction, "❌ Only the ticket creator can close this ticket.")
+        allowed_participants = {
+            str(uid) for uid in deal.get("participants", [])
+        }
+        if deal.get("creator_id"):
+            allowed_participants.add(str(deal["creator_id"]))
+        if str(interaction.user.id) not in allowed_participants:
+            await safe_error(interaction, "❌ Only the two participants can close this ticket.")
             return
-        await interaction.response.send_message("🔒 Closing ticket...", ephemeral=True)
-        _mm_deals.pop(self.deal_id, None)
+        await close_mm_deal(interaction, self.deal_id, deal)
+
+
+class MMReopenButton(discord.ui.Button):
+    def __init__(self, deal_id):
+        super().__init__(label="Reopen Ticket", emoji="🔓", style=discord.ButtonStyle.success, custom_id=f"mm:reopen:{deal_id}")
+        self.deal_id = deal_id
+
+    async def callback(self, interaction: discord.Interaction):
+        deal = _mm_deals.get(self.deal_id)
+        if not deal:
+            await safe_error(interaction, "❌ This MM ticket is no longer available.")
+            return
+        if not mm_staff_or_claimed(interaction, deal):
+            await safe_error(interaction, "❌ Only an MM or support staff member can reopen this ticket.")
+            return
+        await interaction.response.defer(ephemeral=True)
+        _closed_ticket_channels.discard(interaction.channel.id)
+        restored_state = deal.get("state_before_close") or ("mm_available" if not deal.get("claimed_by") else "claimed")
+        deal["state"] = restored_state
+        deal.pop("state_before_close", None)
+        deal.pop("closed_at", None)
         save_mm_deals(_mm_deals)
+        allow = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+        for participant_id in deal.get("participants", []):
+            try:
+                member = interaction.guild.get_member(int(participant_id)) or await interaction.guild.fetch_member(int(participant_id))
+                await interaction.channel.set_permissions(member, overwrite=allow)
+            except Exception as e:
+                print(f"[MM REOPEN MEMBER] {e}")
         try:
-            await interaction.channel.delete(reason=f"MM ticket closed by {interaction.user}")
+            restored_view = {
+                "awaiting_user": MMSelectUserView,
+                "selecting_roles": MMRoleView,
+                "confirming_roles": MMRoleConfirmView,
+                "awaiting_offer": MMOfferEntryView,
+                "confirming": DealConfirmView,
+                "confirming_usd": USDConfirmView,
+                "mm_available": MMClaimView,
+                "claimed": MMClaimView,
+            }.get(deal.get("state"), MMClaimView)
+            await interaction.message.edit(view=restored_view(self.deal_id))
         except Exception as e:
-            print(f"[MM CLOSE] {e}")
+            print(f"[MM REOPEN EDIT] {e}")
+        await interaction.followup.send("🔓 MM ticket reopened.", ephemeral=True)
+
+
+class MMClosedView(discord.ui.View):
+    def __init__(self, deal_id):
+        super().__init__(timeout=None)
+        self.add_item(MMReopenButton(deal_id))
 
 
 class DealConfirmView(discord.ui.View):
@@ -4578,6 +4685,7 @@ class DealConfirmView(discord.ui.View):
         self.deal_id = deal_id
         self.add_item(MMConfirmButton(deal_id))
         self.add_item(MMEditDealButton(deal_id))
+        self.add_item(MMCloseButton(deal_id))
 
 
 # ============================================================
@@ -4708,6 +4816,13 @@ async def restore_mm_views():
         except Exception:
             guild = None
         if guild is None:
+            continue
+        if deal.get("state") == "closed" and deal.get("closed_message_id"):
+            try:
+                bot.add_view(MMClosedView(deal_id), message_id=int(deal["closed_message_id"]))
+                count += 1
+            except Exception as e:
+                print(f"[RESTORE MM CLOSED] {e}")
             continue
         if deal.get("claim_message_id") and not deal.get("claimed_by"):
             try:
