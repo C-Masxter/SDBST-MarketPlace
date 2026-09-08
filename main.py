@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 import time
 import asyncio
+import io
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -3708,9 +3709,78 @@ def mm_staff_or_claimed(interaction, deal):
     return bool(role_ids.intersection({str(r.id) for r in getattr(interaction.user, "roles", [])}))
 
 
+async def create_mm_transcript(interaction, deal):
+    """Create and post a plain-text MM transcript to the configured log channel."""
+    config = await get_server_config(interaction.guild.id)
+    log_channel_id = config.get("negotiation_log_channel_id")
+    try:
+        log_channel = interaction.guild.get_channel(int(log_channel_id)) if log_channel_id else None
+    except (TypeError, ValueError):
+        log_channel = None
+    if not isinstance(log_channel, discord.TextChannel):
+        return None
+
+    participants = [str(uid) for uid in deal.get("participants", [])]
+    buyer_id = next((uid for uid, role in deal.get("roles", {}).items() if role == "buyer"), None)
+    seller_id = next((uid for uid, role in deal.get("roles", {}).items() if role == "seller"), None)
+    buyer = f"<@{buyer_id}>" if buyer_id else (f"<@{participants[0]}>" if participants else "Unknown")
+    seller = f"<@{seller_id}>" if seller_id else (f"<@{participants[1]}>" if len(participants) > 1 else "Unknown")
+    mm_id = deal.get("claimed_by")
+    mm = f"<@{mm_id}>" if mm_id else "Unclaimed"
+    deal_text = deal.get("price") or deal.get("item") or "Not specified"
+    if deal.get("item") and deal.get("price"):
+        deal_text = f"{deal['item']} | {deal['price']}"
+
+    lines = [
+        f"Buyer: {buyer}",
+        f"Seller: {seller}",
+        f"MM: {mm}",
+        f"Deal: {deal_text}",
+        "",
+        f"Channel: #{interaction.channel.name} ({interaction.channel.id})",
+        f"Created: {getattr(interaction.channel, 'created_at', 'Unknown')}",
+        "",
+        "Messages:",
+    ]
+    try:
+        messages = [message async for message in interaction.channel.history(limit=None, oldest_first=True)]
+    except Exception as e:
+        print(f"[MM TRANSCRIPT HISTORY] {e}")
+        messages = []
+    for message in messages:
+        timestamp = message.created_at.isoformat() if getattr(message, "created_at", None) else "Unknown time"
+        content = (message.content or "").replace("\r", "").strip() or "[no text]"
+        lines.append(f"[{timestamp}] {message.author} ({message.author.id}): {content}")
+        for attachment in getattr(message, "attachments", []):
+            lines.append(f"  Attachment: {attachment.url}")
+    transcript = "\n".join(lines) + "\n"
+    filename = f"mm-{interaction.channel.id}-transcript.txt"
+    try:
+        sent = await log_channel.send(
+            content=(
+                f"**MM Transcript**\nBuyer: {buyer}\nSeller: {seller}\n"
+                f"MM: {mm}\nDeal: {deal_text}"
+            ),
+            file=discord.File(io.BytesIO(transcript.encode("utf-8")), filename=filename)
+        )
+        attachment_url = sent.attachments[0].url if sent.attachments else None
+        if attachment_url:
+            await log_channel.send(
+                f"Buyer: {buyer}\nSeller: {seller}\nMM: {mm}\nDeal: {deal_text}\n"
+                f"Transcript link: {attachment_url}"
+            )
+        return attachment_url
+    except Exception as e:
+        print(f"[MM TRANSCRIPT LOG] {e}")
+        return None
+
+
 async def close_mm_deal(interaction, deal_id, deal, source_message=None):
     """Close an MM ticket after the requested five-second delay, without deleting it."""
-    await interaction.response.send_message("🔒 This ticket will close in 5 seconds...", ephemeral=True)
+    if interaction.response.is_done():
+        await interaction.followup.send("🔒 This ticket will close in 5 seconds...", ephemeral=True)
+    else:
+        await interaction.response.send_message("🔒 This ticket will close in 5 seconds...", ephemeral=True)
     await asyncio.sleep(5)
     current = _mm_deals.get(deal_id)
     if not current or current.get("state") == "closed":
@@ -3736,6 +3806,18 @@ async def close_mm_deal(interaction, deal_id, deal, source_message=None):
                 )
         except (TypeError, ValueError, discord.HTTPException) as e:
             print(f"[MM CLOSE STAFF PERMS] {e}")
+    if current.get("claimed_by"):
+        try:
+            claimed_member = interaction.guild.get_member(int(current["claimed_by"]))
+            if claimed_member:
+                await interaction.channel.set_permissions(
+                    claimed_member,
+                    view_channel=True,
+                    send_messages=False,
+                    read_message_history=True
+                )
+        except (TypeError, ValueError, discord.HTTPException) as e:
+            print(f"[MM CLOSE CLAIMED MM PERMS] {e}")
     try:
         message = source_message or interaction.message
         await message.edit(view=MMClosedView(deal_id))
@@ -3878,13 +3960,13 @@ async def close_mm_ticket(interaction: discord.Interaction):
     deal_id, deal = await mm_command_context(interaction)
     if not deal:
         return
-    allowed_participants = {str(uid) for uid in deal.get("participants", [])}
-    if deal.get("creator_id"):
-        allowed_participants.add(str(deal["creator_id"]))
-    if str(interaction.user.id) not in allowed_participants:
-        await safe_error(interaction, "❌ Only the two participants can close this MM ticket.")
-        return
+    await interaction.response.defer(ephemeral=True)
+    transcript_url = await create_mm_transcript(interaction, deal)
     await close_mm_deal(interaction, deal_id, deal)
+    if transcript_url:
+        await interaction.followup.send(f"📄 Transcript logged: {transcript_url}", ephemeral=True)
+    else:
+        await interaction.followup.send("⚠️ Ticket closed, but no transcript log channel is configured or the transcript could not be uploaded.", ephemeral=True)
 
 @bot.tree.command(name="ps", description="Send private-server transfer instructions.")
 @app_commands.describe(seller="Seller to mention")
@@ -3910,7 +3992,7 @@ async def vouch_ticket(interaction: discord.Interaction, seller: discord.Member,
         return
     mm = interaction.guild.get_member(int(deal.get("claimed_by"))) if deal.get("claimed_by") else interaction.user
     amount = deal.get("price") or "the deal amount"
-    await interaction.response.send_message(f"{seller.mention} {buyer.mention}\nThis middleman ticket has been completed.\nPlease leave a vouch for {mm.mention} in {vouch_channel.mention}.\n\nSample vouch format: `Vouch mm {mm.mention} ${amount} deal fast and easy`")
+    await interaction.response.send_message(f"{seller.mention} {buyer.mention}\nThis middleman ticket has been completed.\nPlease leave a vouch for {mm.mention} in {vouch_channel.mention}.\n\nSample vouch format: `Vouch mm {mm.mention} {amount} deal fast and easy`")
     timeout = int(config.get("vouch_timeout_seconds") or 86400)
     _vouch_state[deal_id] = {"deadline": time.time() + timeout, "participants": [str(seller.id), str(buyer.id)], "vouched": [], "blacklisted": [], "blacklist_role_id": str(config.get("blacklist_role_id") or "")}
     deal["state"] = "completed"
