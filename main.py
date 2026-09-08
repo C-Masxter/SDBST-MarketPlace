@@ -1859,18 +1859,18 @@ class MMPanelSettingsView(discord.ui.View):
         await interaction.response.edit_message(embed=refreshed.build_embed(), view=refreshed)
 
 
-class TierMemberSelect(discord.ui.UserSelect):
+class TierRoleSelect(discord.ui.RoleSelect):
     def __init__(self, parent, tier, label):
         self.parent_view = parent
         self.tier = tier
-        super().__init__(placeholder=label, min_values=0, max_values=10, row=parent.tier_rows[tier])
+        super().__init__(placeholder=label, min_values=1, max_values=10, row=parent.tier_rows[tier])
 
     async def callback(self, interaction):
         if not interaction.user.guild_permissions.administrator:
             await safe_error(interaction, "❌ Administrator permissions required.")
             return
-        key = f"mm_tier_members_{self.tier}"
-        ids = ",".join(str(user.id) for user in self.values)
+        key = f"mm_tier_roles_{self.tier}"
+        ids = ",".join(str(role.id) for role in self.values)
         await self.parent_view.save(interaction, key, ids)
 
 
@@ -1894,7 +1894,7 @@ class TierMembersView(discord.ui.View):
             "above_1000": "⚫ Above $1000 members",
         }
         for tier, label in labels.items():
-            self.add_item(TierMemberSelect(self, tier, label))
+            self.add_item(TierRoleSelect(self, tier, label))
 
     def build_embed(self):
         lines = []
@@ -1905,12 +1905,12 @@ class TierMembersView(discord.ui.View):
             ("500_1000", "🔴 $500-$1000"),
             ("above_1000", "⚫ Above $1000"),
         ):
-            ids = str(self.config.get(f"mm_tier_members_{tier}") or "").strip()
-            mentions = " ".join(f"<@{x.strip()}>" for x in ids.split(",") if x.strip()) or "None"
+            ids = str(self.config.get(f"mm_tier_roles_{tier}") or "").strip()
+            mentions = " ".join(f"<@&{x.strip()}>" for x in ids.split(",") if x.strip()) or "None"
             lines.append(f"**{label}:** {mentions}")
         return discord.Embed(
-            title="👥 MM Tier Members",
-            description="Select one or more people for each deal range. They will be invited and pinged when that range is selected.\n\n" + "\n".join(lines),
+            title="👥 MM Tier Roles",
+            description="Select one or more Discord roles for each deal range. Those roles will be invited and pinged after both traders confirm.\n\n" + "\n".join(lines),
             color=discord.Color.blurple()
         )
 
@@ -3623,9 +3623,10 @@ class MMClaimButton(discord.ui.Button):
             if not deal:
                 await interaction.followup.send("❌ This ticket is no longer active.", ephemeral=True)
                 return
-            allowed_ids = {str(uid) for uid in deal.get("tier_member_ids", []) if str(uid).strip()}
-            if str(interaction.user.id) not in allowed_ids:
-                await interaction.followup.send("❌ Only MM members selected for this deal range in `/setup` can claim this ticket.", ephemeral=True)
+            allowed_role_ids = {str(rid) for rid in deal.get("tier_role_ids", []) if str(rid).strip()}
+            member_role_ids = {str(role.id) for role in getattr(interaction.user, "roles", [])}
+            if not allowed_role_ids or not allowed_role_ids.intersection(member_role_ids):
+                await interaction.followup.send("❌ Only members with a configured MM role for this deal range can claim this ticket.", ephemeral=True)
                 return
             if deal.get("claimed_by"):
                 await interaction.followup.send("❌ This ticket has already been claimed.", ephemeral=True)
@@ -3959,27 +3960,27 @@ async def route_mm_for_deal(interaction, deal_id, tier):
     config = await get_server_config(interaction.guild.id)
     deal["tier"] = tier
     deal["state"] = "mm_available"
-    tier_key = f"mm_tier_members_{tier}"
-    configured_tier_ids = [raw_id.strip() for raw_id in str(config.get(tier_key) or "").split(",") if raw_id.strip()]
-    deal["tier_member_ids"] = configured_tier_ids
-    invited = []
-    for raw_id in configured_tier_ids:
+    tier_key = f"mm_tier_roles_{tier}"
+    configured_role_ids = [raw_id.strip() for raw_id in str(config.get(tier_key) or "").split(",") if raw_id.strip()]
+    deal["tier_role_ids"] = configured_role_ids
+    invited_roles = []
+    for raw_id in configured_role_ids:
         try:
-            member = interaction.guild.get_member(int(raw_id.strip()))
-            if member and member.id not in {int(x) for x in deal.get("participants", []) if str(x).isdigit()}:
-                await interaction.channel.set_permissions(member, view_channel=True, send_messages=True, read_message_history=True)
-                invited.append(member)
+            role = interaction.guild.get_role(int(raw_id))
+            if role:
+                await interaction.channel.set_permissions(role, view_channel=True, send_messages=True, read_message_history=True)
+                invited_roles.append(role)
         except (TypeError, ValueError, discord.HTTPException):
             continue
     save_mm_deals(_mm_deals)
-    mentions = " ".join(member.mention for member in invited) or "the configured MM team"
+    mentions = " ".join(role.mention for role in invited_roles) or "the configured MM team"
     claim_embed = discord.Embed(
         title="Middleman Available",
         description=f"Both users confirmed the deal and value. {mentions}, a middleman can claim this ticket.",
         color=MM_LIGHT_BLUE
     )
     participant_mentions = " ".join(f"<@{uid}>" for uid in deal.get("participants", []))
-    team_mentions = " ".join(member.mention for member in invited)
+    team_mentions = " ".join(role.mention for role in invited_roles)
     public_status = (
         f"{participant_mentions}\n\n"
         "🟢 Both users confirmed. The deal-range MM team has been invited and can now claim the ticket."
@@ -3990,7 +3991,7 @@ async def route_mm_for_deal(interaction, deal_id, tier):
         content=public_status,
         embed=claim_embed,
         view=MMClaimView(deal_id),
-        allowed_mentions=discord.AllowedMentions(users=True)
+        allowed_mentions=discord.AllowedMentions(users=True, roles=True)
     )
     deal["claim_message_id"] = str(claim_msg.id)
     save_mm_deals(_mm_deals)
@@ -4138,7 +4139,7 @@ class USDConfirmButton(discord.ui.Button):
                 tier = tier_for_usd(int(deal.get("usd_routing_value") or 0))
                 deal["state"] = "routing_mm"
                 save_mm_deals(_mm_deals)
-                await interaction.message.edit(view=None)
+                await interaction.message.edit(embed=mm_deal_embed(deal), view=None)
                 await route_mm_for_deal(interaction, self.deal_id, tier)
             else:
                 save_mm_deals(_mm_deals)
@@ -4401,15 +4402,13 @@ async def mm(interaction: discord.Interaction):
         interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
         interaction.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True)
     }
-    tier_members = []
-    tier_key = f"mm_tier_members_{mm_tier}" if mm_tier else None
+    tier_roles = []
+    tier_key = f"mm_tier_roles_{mm_tier}" if mm_tier else None
     for raw_id in str(config.get(tier_key) or "").split(",") if tier_key else []:
         try:
-            member = interaction.guild.get_member(int(raw_id.strip()))
-            if member and member.id != interaction.user.id:
-                # Store the configured MM member for later routing, but do not
-                # grant access until both participants confirm the deal/value.
-                tier_members.append(member)
+            role = interaction.guild.get_role(int(raw_id.strip()))
+            if role:
+                tier_roles.append(role)
         except (TypeError, ValueError):
             continue
     try:
@@ -4457,7 +4456,7 @@ async def mm(interaction: discord.Interaction):
         "deal_message_id": None,
         "state": "awaiting_user",
         "tier": mm_tier,
-        "tier_member_ids": [str(member.id) for member in tier_members]
+        "tier_role_ids": [str(role.id) for role in tier_roles]
     }
     save_mm_deals(_mm_deals)
     if select_msg:
