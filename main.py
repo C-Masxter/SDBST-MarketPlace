@@ -575,8 +575,10 @@ async def get_server_config(guild_id):
 
         backend = {}
 
-    # Local overrides so settings persist even if the
-    # backend strips unknown keys.
+    # The backend is authoritative whenever it has a non-empty value.
+    # Local values are only a fallback for keys the backend does not
+    # return. Otherwise an old local role such as @Mm can override the
+    # role most recently selected in /setup.
 
     local = _bot_config.get(
         str(int(guild_id)),
@@ -587,7 +589,9 @@ async def get_server_config(guild_id):
 
     merged.update(backend)
 
-    merged.update(local)
+    for key, value in local.items():
+        if key not in merged or merged.get(key) in (None, "", [], {}):
+            merged[key] = value
 
     return merged
 
@@ -1933,6 +1937,7 @@ class TierMembersView(discord.ui.View):
         self.config[key] = value
         _bot_config.setdefault(str(interaction.guild.id), {})[key] = value
         save_bot_config(_bot_config)
+        invalidate_config_cache(interaction.guild.id)
         refreshed = TierMembersView(self.guild, self.config)
         await interaction.response.edit_message(embed=refreshed.build_embed(), view=refreshed)
 
@@ -4157,7 +4162,11 @@ async def route_mm_for_deal(interaction, deal_id, tier):
     deal["tier"] = tier
     deal["state"] = "mm_available"
     tier_key = f"mm_tier_roles_{tier}"
-    configured_role_ids = [raw_id.strip() for raw_id in str(config.get(tier_key) or "").split(",") if raw_id.strip()]
+    configured_role_ids = []
+    for raw_id in str(config.get(tier_key) or "").split(","):
+        raw_id = raw_id.strip()
+        if raw_id and raw_id not in configured_role_ids:
+            configured_role_ids.append(raw_id)
     deal["tier_role_ids"] = configured_role_ids
     invited_roles = []
     for raw_id in configured_role_ids:
@@ -4169,14 +4178,20 @@ async def route_mm_for_deal(interaction, deal_id, tier):
         except (TypeError, ValueError, discord.HTTPException):
             continue
     save_mm_deals(_mm_deals)
-    mentions = " ".join(role.mention for role in invited_roles) or "the configured MM team"
+    # Build mentions from the IDs selected in /setup, rather than from a
+    # stale deal snapshot. This guarantees that the role selected for this
+    # price range (for example @Head mm) is the role that gets pinged.
+    configured_mentions = " ".join(
+        f"<@&{role.id}>" for role in invited_roles
+    )
+    mentions = configured_mentions or "the configured MM team"
     claim_embed = discord.Embed(
         title="Middleman Available",
         description=f"Both users confirmed the deal and value. {mentions}, a middleman can claim this ticket.",
         color=MM_LIGHT_BLUE
     )
     participant_mentions = " ".join(f"<@{uid}>" for uid in deal.get("participants", []))
-    team_mentions = " ".join(role.mention for role in invited_roles)
+    team_mentions = configured_mentions
     public_status = (
         f"{participant_mentions}\n\n"
         "🟢 Both users confirmed. The deal-range MM team has been invited and can now claim the ticket."
@@ -4332,7 +4347,12 @@ class USDConfirmButton(discord.ui.Button):
             deal["usd_confirmed"] = confirmed
             participants = [str(uid) for uid in deal.get("participants", [])]
             if participants and all(confirmed.get(uid, False) for uid in participants):
-                tier = tier_for_usd(int(deal.get("usd_routing_value") or 0))
+                # If the ticket was created from the MM panel, its selected
+                # category is the source of truth. Recalculating from the
+                # price here could route it to a different category and
+                # ping the wrong /setup role. Direct /mm tickets without a
+                # selected category still fall back to the price range.
+                tier = deal.get("tier") or tier_for_usd(int(deal.get("usd_routing_value") or 0))
                 deal["state"] = "routing_mm"
                 save_mm_deals(_mm_deals)
                 await interaction.message.edit(embed=mm_deal_embed(deal), view=None)
@@ -4493,7 +4513,8 @@ class MMConfirmButton(discord.ui.Button):
                 deal["state"] = "routing_mm"
                 save_mm_deals(_mm_deals)
                 await interaction.message.edit(embed=mm_deal_embed(deal), view=None)
-                await route_mm_for_deal(interaction, self.deal_id, tier_for_usd(deal["usd_routing_value"]))
+                tier = deal.get("tier") or tier_for_usd(deal["usd_routing_value"])
+                await route_mm_for_deal(interaction, self.deal_id, tier)
             else:
                 save_mm_deals(_mm_deals)
                 await interaction.message.edit(embed=mm_deal_embed(deal), view=DealConfirmView(self.deal_id))
