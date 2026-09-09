@@ -4987,15 +4987,12 @@ class MMCloseButton(discord.ui.Button):
         if not deal:
             await safe_error(interaction, "❌ This ticket is no longer active.")
             return
-        allowed_participants = {
-            str(uid) for uid in deal.get("participants", [])
-        }
-        if deal.get("creator_id"):
-            allowed_participants.add(str(deal["creator_id"]))
-        if deal.get("claimed_by"):
-            allowed_participants.add(str(deal["claimed_by"]))
-        if str(interaction.user.id) not in allowed_participants:
-            await safe_error(interaction, "❌ Only the Buyer, Seller, or claimed MM can close this ticket.")
+        if getattr(interaction.user, "bot", False):
+            await safe_error(interaction, "❌ Bots cannot close this ticket.")
+            return
+        channel_permissions = interaction.channel.permissions_for(interaction.user)
+        if not channel_permissions.view_channel:
+            await safe_error(interaction, "❌ You must be able to view this ticket to close it.")
             return
         await close_mm_deal(interaction, self.deal_id, deal)
 
