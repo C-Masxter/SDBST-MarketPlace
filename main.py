@@ -4460,14 +4460,21 @@ def tier_for_usd(value):
 
 
 class USDValueModal(discord.ui.Modal):
-    def __init__(self, deal_id):
-        super().__init__(title="Enter Deal")
+    def __init__(self, deal_id, existing=None):
+        is_edit = bool(existing)
+        super().__init__(title="Edit Deal" if is_edit else "Enter Deal")
         self.deal_id = deal_id
+        existing = existing or {}
+        existing_details = existing.get("price") or ""
+        if existing.get("item") and existing.get("payment_method"):
+            existing_details = f"{existing['item']}, {existing['price']}, {existing['payment_method']}"
+        existing_details = str(existing_details)[:100]
         self.value_input = discord.ui.TextInput(
             label="Deal Details",
             placeholder="Example: Item, Price, Payment Method",
             max_length=100,
-            required=True
+            required=True,
+            default=existing_details
         )
         self.add_item(self.value_input)
 
@@ -4490,7 +4497,10 @@ class USDValueModal(discord.ui.Modal):
                 await interaction.followup.send("❌ This deal is no longer active.", ephemeral=True)
                 return
             deal["price"] = raw
+            deal["item"] = None
+            deal["payment_method"] = None
             deal["usd_routing_value"] = value
+            deal["confirmed"] = {uid: False for uid in deal.get("participants", [])}
             deal["usd_confirmed"] = {uid: False for uid in deal.get("participants", [])}
             deal["state"] = "confirming_usd"
             deal["offer_value_user_id"] = str(interaction.user.id)
@@ -4784,7 +4794,7 @@ class MMEditDealButton(discord.ui.Button):
         if str(interaction.user.id) not in {str(uid) for uid in deal.get("participants", [])}:
             await safe_error(interaction, "❌ Only the deal participants can edit the deal.")
             return
-        await interaction.response.send_modal(EnterDealModal(self.deal_id, existing=deal))
+        await interaction.response.send_modal(USDValueModal(self.deal_id, existing=deal))
 
 
 class MMCloseButton(discord.ui.Button):
