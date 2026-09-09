@@ -371,6 +371,30 @@ def mm_flow_lock(deal_id):
 MM_LIGHT_BLUE = discord.Color.from_rgb(110, 190, 255)
 MM_FLOW_DIVIDER = "━━━━━━━━━━━━━━━━━━━━"
 MAX_OPEN_TICKETS_PER_USER = 20
+
+
+def channel_creation_error_message(error, *, mm=False):
+    code = getattr(error, "code", None)
+    status = getattr(error, "status", "?")
+    if code == 60003:
+        return (
+            "❌ Discord requires two-factor authentication for moderation actions "
+            "in this server (error 60003). The server owner must disable "
+            "Server Settings → Safety Setup → Require 2FA for moderation actions "
+            "before the bot can create ticket channels."
+        )
+    if code == 30013:
+        return (
+            "❌ This server has reached Discord's maximum channel limit (error 30013). "
+            "Delete unused channels before creating another ticket."
+        )
+    prefix = "MM " if mm else ""
+    return (
+        f"❌ Discord rejected {prefix}ticket creation. status={status}, code={code}. "
+        "Check the bot role and server/category channel limits."
+    )
+
+
 MM_TICKET_COUNTER_START = 8000
 MM_TICKET_COUNTER_FILE = Path("mm_ticket_counter.json")
 MM_CLAIM_COUNTS_FILE = Path("mm_claim_counts.json")
@@ -3186,15 +3210,7 @@ class AdButtons(discord.ui.View):
                 print(f"[CHANNEL CREATE FALLBACK] Created {ticket_channel} outside the configured category.")
             except (discord.Forbidden, discord.HTTPException) as fallback_error:
                 print(f"[CHANNEL CREATE FALLBACK FAILED] status={getattr(fallback_error, 'status', '?')} code={getattr(fallback_error, 'code', '?')} error={fallback_error}")
-                await safe_error(
-                    interaction,
-                    (
-                        "❌ Discord rejected ticket creation. "
-                        f"status={getattr(fallback_error, 'status', '?')}, "
-                        f"code={getattr(fallback_error, 'code', '?')}. "
-                        "Check the bot role and server/category channel limits."
-                    )
-                )
+                await safe_error(interaction, channel_creation_error_message(fallback_error))
                 return
 
         # ----------------------------------------------------
@@ -4097,8 +4113,8 @@ async def mm_command_context(interaction):
     if not deal:
         await safe_error(interaction, "❌ This command can only be used in an MM ticket.")
         return None, None
-    if not mm_staff_or_claimed(interaction, deal):
-        await safe_error(interaction, "❌ Only staff or the claimed MM can use this command.")
+    if str(deal.get("claimed_by")) != str(interaction.user.id):
+        await safe_error(interaction, "❌ Only the MM who claimed this ticket can use this command.")
         return None, None
     return deal_id, deal
 
@@ -5070,15 +5086,7 @@ async def mm(interaction: discord.Interaction):
             print(f"[MM CHANNEL FALLBACK] Created {ticket_channel} outside the configured category.")
         except (discord.Forbidden, discord.HTTPException) as fallback_error:
             print(f"[MM CHANNEL FALLBACK FAILED] status={getattr(fallback_error, 'status', '?')} code={getattr(fallback_error, 'code', '?')} error={fallback_error}")
-            await interaction.followup.send(
-                (
-                    "❌ Discord rejected MM ticket creation. "
-                    f"status={getattr(fallback_error, 'status', '?')}, "
-                    f"code={getattr(fallback_error, 'code', '?')}. "
-                    "Check the bot role and server/category channel limits."
-                ),
-                ephemeral=True
-            )
+            await interaction.followup.send(channel_creation_error_message(fallback_error, mm=True), ephemeral=True)
             return
     deal_id = uuid.uuid4().hex[:8]
     claim_msg = None
