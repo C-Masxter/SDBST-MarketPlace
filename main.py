@@ -453,7 +453,8 @@ def get_mm_claim_counts(guild_id):
 
 def mm_step(step, title, next_step=None):
     """Format a compact, consistent progress header for MM prompts."""
-    text = f"**🤝 Step {step}/3 • {title}**"
+    emoji = "📝" if int(step) == 3 else "🤝"
+    text = f"**{emoji} Step {step}/3 • {title}**"
     if next_step:
         text += f"\n{MM_FLOW_DIVIDER}\n**Next:** {next_step}"
     return text
@@ -854,7 +855,7 @@ def mm_deal_embed(deal):
 
     buyer_id = next((str(uid) for uid, role in deal.get("roles", {}).items() if role == "buyer"), None)
     seller_id = next((str(uid) for uid, role in deal.get("roles", {}).items() if role == "seller"), None)
-    embed_title = "🤝 Step 3/3 • Confirm Deal" if deal.get("state") == "confirming_usd" else "ENTER DEAL DETAILS"
+    embed_title = "📝 Step 3/3 • Confirm Deal" if deal.get("state") == "confirming_usd" else "ENTER DEAL DETAILS"
     embed = discord.Embed(title=embed_title, description=description, color=MM_LIGHT_BLUE)
     embed.add_field(name="Buyer", value=f"<@{buyer_id}>" if buyer_id else "—", inline=True)
     embed.add_field(name="Seller", value=f"<@{seller_id}>" if seller_id else "—", inline=True)
@@ -4133,8 +4134,8 @@ async def mm_command_context(interaction):
     if not deal:
         await safe_error(interaction, "❌ This command can only be used in an MM ticket.")
         return None, None
-    if str(deal.get("claimed_by")) != str(interaction.user.id):
-        await safe_error(interaction, "❌ Only the MM who claimed this ticket can use this command.")
+    if not mm_staff_or_claimed(interaction, deal):
+        await safe_error(interaction, "❌ Only a configured MM/support role or the claimed MM can use this command.")
         return None, None
     return deal_id, deal
 
@@ -4244,20 +4245,28 @@ async def vouch_ticket(interaction: discord.Interaction, seller: discord.Member,
     deal_id, deal = await mm_command_context(interaction)
     if not deal:
         return
+    await interaction.response.defer()
     config = await get_server_config(interaction.guild.id)
     vouch_channel_id = config.get("vouches_channel_id")
-    vouch_channel = interaction.guild.get_channel(int(vouch_channel_id)) if vouch_channel_id else None
+    try:
+        vouch_channel = interaction.guild.get_channel(int(vouch_channel_id)) if vouch_channel_id else None
+    except (TypeError, ValueError):
+        vouch_channel = None
     if not vouch_channel:
-        await safe_error(interaction, "❌ Configure the vouches channel in `/setup` first.")
+        await interaction.followup.send("❌ Configure a valid vouches channel in `/setup` first.", ephemeral=True)
         return
-    mm = interaction.guild.get_member(int(deal.get("claimed_by"))) if deal.get("claimed_by") else interaction.user
-    amount = deal.get("price") or "the deal amount"
-    await interaction.response.send_message(f"{seller.mention} {buyer.mention}\nThis middleman ticket has been completed.\nPlease leave a vouch for {mm.mention} in {vouch_channel.mention}.\n\nSample vouch format: `Vouch mm {mm.mention} {amount} deal fast and easy`")
-    timeout = int(config.get("vouch_timeout_seconds") or 86400)
-    _vouch_state[deal_id] = {"deadline": time.time() + timeout, "participants": [str(seller.id), str(buyer.id)], "vouched": [], "blacklisted": [], "blacklist_role_id": str(config.get("blacklist_role_id") or "")}
-    deal["state"] = "completed"
-    save_vouch_state()
-    save_mm_deals(_mm_deals)
+    try:
+        mm = interaction.guild.get_member(int(deal.get("claimed_by"))) if deal.get("claimed_by") else interaction.user
+        amount = deal.get("price") or "the deal amount"
+        await interaction.followup.send(f"{seller.mention} {buyer.mention}\nThis middleman ticket has been completed.\nPlease leave a vouch for {mm.mention} in {vouch_channel.mention}.\n\nSample vouch format: `Vouch mm {mm.mention} {amount} deal fast and easy`")
+        timeout = int(config.get("vouch_timeout_seconds") or 86400)
+        _vouch_state[deal_id] = {"deadline": time.time() + timeout, "participants": [str(seller.id), str(buyer.id)], "vouched": [], "blacklisted": [], "blacklist_role_id": str(config.get("blacklist_role_id") or "")}
+        deal["state"] = "completed"
+        save_vouch_state()
+        save_mm_deals(_mm_deals)
+    except Exception as e:
+        print(f"[VOUCH COMMAND] deal={deal_id}: {e}")
+        await interaction.followup.send("❌ Vouch setup failed. Check that the bot can view and send messages in the vouches channel.", ephemeral=True)
 
 class MMRoleButton(discord.ui.Button):
     def __init__(self, deal_id, role, label, emoji):
@@ -4388,7 +4397,7 @@ class MMRoleDecisionButton(discord.ui.Button):
                 deal["state"] = "awaiting_offer"
                 save_mm_deals(_mm_deals)
                 next_embed = role_confirmation_embed(deal)
-                next_embed.title = "🤝 Step 3/3 • Enter Deal Details"
+                next_embed.title = "📝 Step 3/3 • Enter Deal Details"
                 next_embed.description = (
                     mm_step(3, "Enter deal details", "Either the Buyer or Seller can enter the trade information.")
                     + "\n\n" + role_summary(deal)
