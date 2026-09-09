@@ -1204,6 +1204,21 @@ def sticky_text_for_channel(config, channel_id):
 # SETUP VIEW
 # ============================================================
 
+def setup_authorized(interaction, config=None):
+    """Allow Discord admins or the server's configured setup-admin role."""
+    if interaction.user.guild_permissions.administrator:
+        return True
+    config = config or {}
+    configured_role_id = str(config.get("setup_admin_role_id") or "").strip()
+    return bool(
+        configured_role_id
+        and configured_role_id in {str(role.id) for role in getattr(interaction.user, "roles", [])}
+    )
+
+
+def setup_denied_message():
+    return "❌ Administrator permissions or the configured setup-admin role is required."
+
 def channel_default(guild, channel_id):
     """
     Turn a saved channel ID into a Discord default value
@@ -1275,11 +1290,11 @@ class ConfigChannelSelect(discord.ui.ChannelSelect):
         interaction: discord.Interaction
     ):
 
-        if not interaction.user.guild_permissions.administrator:
+        if not setup_authorized(interaction, getattr(getattr(self, "parent_view", None), "config", None)):
 
             await safe_error(
                 interaction,
-                "❌ Administrator permissions required."
+                setup_denied_message()
             )
 
             return
@@ -1350,11 +1365,11 @@ class StickyTextButton(discord.ui.Button):
         interaction: discord.Interaction
     ):
 
-        if not interaction.user.guild_permissions.administrator:
+        if not setup_authorized(interaction, getattr(getattr(self, "parent_view", None), "config", None)):
 
             await safe_error(
                 interaction,
-                "❌ Administrator permissions required."
+                setup_denied_message()
             )
 
             return
@@ -1397,11 +1412,11 @@ class StickyToggleButton(discord.ui.Button):
         interaction: discord.Interaction
     ):
 
-        if not interaction.user.guild_permissions.administrator:
+        if not setup_authorized(interaction, getattr(getattr(self, "parent_view", None), "config", None)):
 
             await safe_error(
                 interaction,
-                "❌ Administrator permissions required."
+                setup_denied_message()
             )
 
             return
@@ -1647,11 +1662,11 @@ class StickySettingsButton(discord.ui.Button):
         interaction: discord.Interaction
     ):
 
-        if not interaction.user.guild_permissions.administrator:
+        if not setup_authorized(interaction, getattr(getattr(self, "parent_view", None), "config", None)):
 
             await safe_error(
                 interaction,
-                "❌ Administrator permissions required."
+                setup_denied_message()
             )
 
             return
@@ -1683,8 +1698,8 @@ class LockedChannelSelect(discord.ui.ChannelSelect):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.administrator:
-            await safe_error(interaction, "❌ Administrator permissions required.")
+        if not setup_authorized(interaction, getattr(getattr(self, "parent_view", None), "config", None)):
+            await safe_error(interaction, setup_denied_message())
             return
         ids = ",".join(str(c.id) for c in self.values)
         await self.parent_view.save(interaction, "locked_channel_ids", ids)
@@ -1707,8 +1722,8 @@ class MMCategorySelect(discord.ui.ChannelSelect):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.administrator:
-            await safe_error(interaction, "❌ Administrator permissions required.")
+        if not setup_authorized(interaction, getattr(getattr(self, "parent_view", None), "config", None)):
+            await safe_error(interaction, setup_denied_message())
             return
         val = self.values[0].id if self.values else ""
         await self.parent_view.save(interaction, "mm_ticket_category_id", val)
@@ -1757,8 +1772,8 @@ class MMAutoDetectToggle(discord.ui.Button):
                         row=row
         )
     async def callback(self, interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.administrator:
-            await safe_error(interaction, "❌ Administrator permissions required.")
+        if not setup_authorized(interaction, getattr(getattr(self, "parent_view", None), "config", None)):
+            await safe_error(interaction, setup_denied_message())
             return
         on = str(
             (self.parent_view.config or {}).get("mm_autodetect", "true")
@@ -1814,8 +1829,8 @@ class MMPrefixButton(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.administrator:
-            await safe_error(interaction, "❌ Administrator permissions required.")
+        if not setup_authorized(interaction, getattr(getattr(self, "parent_view", None), "config", None)):
+            await safe_error(interaction, setup_denied_message())
             return
         await interaction.response.send_modal(
             MMPrefixModal(self.parent_view)
@@ -1949,8 +1964,8 @@ class TierRoleSelect(discord.ui.RoleSelect):
         super().__init__(placeholder=label, min_values=1, max_values=10, row=parent.tier_rows[tier])
 
     async def callback(self, interaction):
-        if not interaction.user.guild_permissions.administrator:
-            await safe_error(interaction, "❌ Administrator permissions required.")
+        if not setup_authorized(interaction, getattr(getattr(self, "parent_view", None), "config", None)):
+            await safe_error(interaction, setup_denied_message())
             return
         key = f"mm_tier_roles_{self.tier}"
         ids = ",".join(str(role.id) for role in self.values)
@@ -2018,8 +2033,8 @@ class TierMembersButton(discord.ui.Button):
         super().__init__(label="Tier Roles", emoji="👥", style=discord.ButtonStyle.secondary, row=4)
 
     async def callback(self, interaction):
-        if not interaction.user.guild_permissions.administrator:
-            await safe_error(interaction, "❌ Administrator permissions required.")
+        if not setup_authorized(interaction, getattr(getattr(self, "parent_view", None), "config", None)):
+            await safe_error(interaction, setup_denied_message())
             return
         config = await get_server_config(interaction.guild.id)
         view = TierMembersView(interaction.guild, config)
@@ -2032,8 +2047,8 @@ class MMPanelSettingsButton(discord.ui.Button):
         self.parent_view = parent
 
     async def callback(self, interaction):
-        if not interaction.user.guild_permissions.administrator:
-            await safe_error(interaction, "❌ Administrator permissions required.")
+        if not setup_authorized(interaction, getattr(getattr(self, "parent_view", None), "config", None)):
+            await safe_error(interaction, setup_denied_message())
             return
         config = await get_server_config(interaction.guild.id)
         view = MMPanelSettingsView(interaction.guild, config)
@@ -2070,6 +2085,7 @@ class ChannelSettingsView(discord.ui.View):
         self.add_item(MMAutoDetectToggle(self, row=4))
         self.add_item(MMPrefixButton(self, row=4))
         self.add_item(MMPanelSettingsButton(self))
+        self.add_item(VouchSettingsButton(self))
 
     def build_embed(self):
         return channel_settings_embed(self.guild, self.config)
@@ -2103,8 +2119,8 @@ class ChannelSettingsButton(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.administrator:
-            await safe_error(interaction, "❌ Administrator permissions required.")
+        if not setup_authorized(interaction, getattr(getattr(self, "parent_view", None), "config", None)):
+            await safe_error(interaction, setup_denied_message())
             return
         view = ChannelSettingsView(self.parent_view.guild, self.parent_view.config)
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
@@ -2163,8 +2179,8 @@ class NegotiationLogButton(discord.ui.Button):
         )
 
     async def callback(self, interaction):
-        if not interaction.user.guild_permissions.administrator:
-            await safe_error(interaction, "❌ Administrator permissions required.")
+        if not setup_authorized(interaction, getattr(getattr(self, "parent_view", None), "config", None)):
+            await safe_error(interaction, setup_denied_message())
             return
         config = await get_server_config(interaction.guild.id)
         view = NegotiationLogSettingsView(interaction.guild, config)
@@ -2204,10 +2220,89 @@ class VouchSettingsButton(discord.ui.Button):
         self.parent_view = parent
         super().__init__(label="Vouch Settings", emoji="📝", style=discord.ButtonStyle.secondary, row=4)
     async def callback(self, interaction):
-        if not interaction.user.guild_permissions.administrator:
-            await safe_error(interaction, "❌ Administrator permissions required.")
+        if not setup_authorized(interaction, getattr(getattr(self, "parent_view", None), "config", None)):
+            await safe_error(interaction, setup_denied_message())
             return
         await interaction.response.send_modal(VouchSettingsModal(self.parent_view))
+
+
+def configured_role(guild, role_id):
+    try:
+        role = guild.get_role(int(role_id)) if role_id else None
+        return role.mention if role else "Not configured"
+    except (TypeError, ValueError):
+        return "Not configured"
+
+
+def role_default(guild, role_id):
+    try:
+        role = guild.get_role(int(role_id)) if role_id else None
+        return [discord.SelectDefaultValue.from_role(role)] if role else []
+    except (TypeError, ValueError, AttributeError):
+        return []
+
+
+class SetupAdminRoleSelect(discord.ui.RoleSelect):
+    def __init__(self, parent):
+        self.parent_view = parent
+        super().__init__(
+            placeholder="Select the role allowed to configure the bot",
+            min_values=1,
+            max_values=1,
+            default_values=role_default(parent.guild, parent.config.get("setup_admin_role_id"))
+        )
+
+    async def callback(self, interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await safe_error(interaction, "❌ Only a Discord server administrator can change this role.")
+            return
+        await self.parent_view.save(interaction, "setup_admin_role_id", self.values[0].id)
+
+
+class SetupAdminRoleBackButton(discord.ui.Button):
+    def __init__(self, parent):
+        self.parent_view = parent
+        super().__init__(label="Back to Setup", emoji="⬅️", style=discord.ButtonStyle.primary, row=4)
+
+    async def callback(self, interaction):
+        view = SetupView(self.parent_view.guild, self.parent_view.config)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+
+class SetupAdminRoleView(discord.ui.View):
+    def __init__(self, parent):
+        super().__init__(timeout=300)
+        self.guild = parent.guild
+        self.config = dict(parent.config or {})
+        self.parent_view = parent
+        self.add_item(SetupAdminRoleSelect(self))
+        self.add_item(SetupAdminRoleBackButton(self))
+
+    async def save(self, interaction, key, value):
+        await self.parent_view.save(interaction, key, value)
+
+
+class SetupAdminRoleButton(discord.ui.Button):
+    def __init__(self, parent):
+        self.parent_view = parent
+        super().__init__(label="ADMINISTRATOR ROLE", emoji="🛡️", style=discord.ButtonStyle.primary, row=4)
+
+    async def callback(self, interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await safe_error(interaction, "❌ Only a Discord server administrator can change this role.")
+            return
+        view = SetupAdminRoleView(self.parent_view)
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="🛡️ Setup Administrator",
+                description=(
+                    "Select one role whose members can fully configure the bot in `/setup`.\n\n"
+                    f"**Current role:** {configured_role(self.parent_view.guild, self.parent_view.config.get('setup_admin_role_id'))}"
+                ),
+                color=discord.Color.blurple()
+            ),
+            view=view
+        )
 
 class SetupView(discord.ui.View):
 
@@ -2281,9 +2376,7 @@ class SetupView(discord.ui.View):
             TierMembersButton(self)
         )
 
-        self.add_item(
-            VouchSettingsButton(self)
-        )
+        self.add_item(SetupAdminRoleButton(self))
 
 
     def build_embed(self):
@@ -2440,6 +2533,9 @@ def setup_embed(guild, server_config):
             f"🤝 **MM Channel:** "
             f"{mm_ch}\n"
 
+            f"🛡️ **Setup Administrator:** "
+            f"{configured_role(guild, server_config.get('setup_admin_role_id'))}\n"
+
             f"📦 **Stock Post Channel:** "
             f"{stock_ch}\n"
 
@@ -2460,10 +2556,7 @@ def setup_embed(guild, server_config):
     )
 
     embed.set_footer(
-        text=(
-            "Only server administrators "
-            "can configure the bot."
-        )
+        text="Server administrators or the configured Setup Administrator role can configure the bot."
     )
 
     return embed
@@ -2533,9 +2626,6 @@ def channel_settings_embed(guild, server_config):
     name="setup",
     description="Configure SDBST Marketplace."
 )
-@app_commands.checks.has_permissions(
-    administrator=True
-)
 async def setup(
     interaction: discord.Interaction
 ):
@@ -2549,12 +2639,16 @@ async def setup(
 
         return
 
-    await interaction.response.defer(
-        ephemeral=True
-    )
-
     server_config = await get_server_config(
         interaction.guild.id
+    )
+
+    if not setup_authorized(interaction, server_config):
+        await safe_error(interaction, setup_denied_message())
+        return
+
+    await interaction.response.defer(
+        ephemeral=True
     )
 
     view = SetupView(
