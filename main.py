@@ -3028,6 +3028,13 @@ class AdButtons(discord.ui.View):
 
             return
 
+        if str(category_id) == str(config.get("mm_ticket_category_id") or ""):
+            await safe_error(
+                interaction,
+                "❌ Offer Ticket Category and MM Ticket Category cannot be the same. Set separate categories in `/setup` → Channels."
+            )
+            return
+
         try:
 
             category_id = int(
@@ -5065,9 +5072,12 @@ async def mm(interaction: discord.Interaction):
         await safe_error(interaction, "❌ This command must be used inside a server.")
         return
     config = await get_server_config(interaction.guild.id)
-    category_id = config.get("mm_ticket_category_id") or config.get("ticket_category_id")
+    category_id = config.get("mm_ticket_category_id")
     if not category_id:
-        await safe_error(interaction, "❌ Tickets aren't configured. Ask an admin to run `/setup`.")
+        await safe_error(
+            interaction,
+            "❌ MM Ticket Category is not configured. Set it in `/setup` → Channels → MM Ticket Category."
+        )
         return
     try:
         category_id = int(category_id)
