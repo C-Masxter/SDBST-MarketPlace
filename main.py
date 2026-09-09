@@ -4297,12 +4297,19 @@ async def vouch_ticket(interaction: discord.Interaction):
         if not buyer_id or not seller_id:
             await interaction.followup.send("❌ The buyer and seller have not been identified in this MM ticket yet.", ephemeral=True)
             return
-        mm = interaction.guild.get_member(int(deal.get("claimed_by"))) if deal.get("claimed_by") else interaction.user
+        mm_id = str(deal.get("claimed_by") or interaction.user.id)
+        mm = interaction.guild.get_member(int(mm_id))
+        if mm is None and deal.get("claimed_by"):
+            try:
+                mm = await interaction.guild.fetch_member(int(mm_id))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError):
+                mm = None
+        mm_mention = mm.mention if mm is not None else f"<@{mm_id}>"
         amount = deal.get("price") or "the deal amount"
         await interaction.followup.send(
             f"<@{buyer_id}> <@{seller_id}>\nThis middleman ticket has been completed.\n"
-            f"Please leave a vouch for {mm.mention} in {vouch_channel.mention}.\n\n"
-            f"Sample vouch format: `Vouch mm {mm.mention} {amount} deal fast and easy`",
+            f"Please leave a vouch for {mm_mention} in {vouch_channel.mention}.\n\n"
+            f"Sample vouch format: `Vouch mm {mm_mention} {amount} deal fast and easy`",
             allowed_mentions=discord.AllowedMentions(users=True)
         )
         try:
