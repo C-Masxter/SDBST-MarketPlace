@@ -4237,18 +4237,23 @@ async def ticket_count_change(interaction: discord.Interaction, member: discord.
     )
 
 @bot.tree.command(name="ps", description="Send private-server transfer instructions.")
-@app_commands.describe(seller="Seller to mention")
-async def private_server(interaction: discord.Interaction, seller: discord.Member):
+async def private_server(interaction: discord.Interaction):
     deal_id, deal = await mm_command_context(interaction)
     if not deal:
         return
     config = await get_server_config(interaction.guild.id)
     link = str(config.get("roblox_private_server_link") or "https://www.roblox.com/share?code=4467a3deb2306548b3fec0065a4c85f9&type=Server")
-    await interaction.response.send_message(f"{seller.mention} Join the private server and transfer your items to the Middleman:\n{link}")
+    seller_id = next((str(uid) for uid, role in deal.get("roles", {}).items() if role == "seller"), None)
+    if not seller_id:
+        await safe_error(interaction, "❌ The seller has not been selected in this MM ticket yet.")
+        return
+    await interaction.response.send_message(
+        f"<@{seller_id}> Join the private server and transfer your items to the Middleman:\n{link}",
+        allowed_mentions=discord.AllowedMentions(users=True)
+    )
 
 @bot.tree.command(name="vouch", description="Complete an MM ticket and request vouches.")
-@app_commands.describe(seller="Seller", buyer="Buyer")
-async def vouch_ticket(interaction: discord.Interaction, seller: discord.Member, buyer: discord.Member):
+async def vouch_ticket(interaction: discord.Interaction):
     deal_id, deal = await mm_command_context(interaction)
     if not deal:
         return
@@ -4272,18 +4277,27 @@ async def vouch_ticket(interaction: discord.Interaction, seller: discord.Member,
         )
         return
     try:
+        buyer_id = next((str(uid) for uid, role in deal.get("roles", {}).items() if role == "buyer"), None)
+        seller_id = next((str(uid) for uid, role in deal.get("roles", {}).items() if role == "seller"), None)
+        participants = [str(uid) for uid in deal.get("participants", [])]
+        buyer_id = buyer_id or (participants[0] if participants else None)
+        seller_id = seller_id or (participants[1] if len(participants) > 1 else None)
+        if not buyer_id or not seller_id:
+            await interaction.followup.send("❌ The buyer and seller have not been identified in this MM ticket yet.", ephemeral=True)
+            return
         mm = interaction.guild.get_member(int(deal.get("claimed_by"))) if deal.get("claimed_by") else interaction.user
         amount = deal.get("price") or "the deal amount"
         await interaction.followup.send(
-            f"{seller.mention} {buyer.mention}\nThis middleman ticket has been completed.\n"
+            f"<@{buyer_id}> <@{seller_id}>\nThis middleman ticket has been completed.\n"
             f"Please leave a vouch for {mm.mention} in {vouch_channel.mention}.\n\n"
-            f"Sample vouch format: `Vouch mm {mm.mention} {amount} deal fast and easy`"
+            f"Sample vouch format: `Vouch mm {mm.mention} {amount} deal fast and easy`",
+            allowed_mentions=discord.AllowedMentions(users=True)
         )
         try:
             timeout = int(config.get("vouch_timeout_seconds") or 86400)
         except (TypeError, ValueError):
             timeout = 86400
-        _vouch_state[deal_id] = {"deadline": time.time() + timeout, "participants": [str(seller.id), str(buyer.id)], "vouched": [], "blacklisted": [], "blacklist_role_id": str(config.get("blacklist_role_id") or "")}
+        _vouch_state[deal_id] = {"deadline": time.time() + timeout, "participants": [seller_id, buyer_id], "vouched": [], "blacklisted": [], "blacklist_role_id": str(config.get("blacklist_role_id") or "")}
         deal["state"] = "completed"
         save_vouch_state()
         save_mm_deals(_mm_deals)
