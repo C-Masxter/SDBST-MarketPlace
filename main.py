@@ -4200,12 +4200,19 @@ async def ticket_count(interaction: discord.Interaction):
         await interaction.response.send_message("📊 No MM tickets have been claimed this month yet.", ephemeral=True)
         return
     ranked = sorted(counts.items(), key=lambda item: (-int(item[1]), item[0]))
-    lines = [
-        f"{index}. <@{user_id}> has claimed **{int(total)}** ticket{'s' if int(total) != 1 else ''} this month"
-        for index, (user_id, total) in enumerate(ranked, start=1)
-    ]
+    lines = []
+    for index, (user_id, total) in enumerate(ranked, start=1):
+        try:
+            member = interaction.guild.get_member(int(user_id))
+        except (TypeError, ValueError):
+            member = None
+        display_name = member.display_name if member else f"User {user_id}"
+        lines.append(
+            f"{index}. {display_name} has claimed **{int(total)}** ticket{'s' if int(total) != 1 else ''} this month"
+        )
     await interaction.response.send_message(
-        f"📊 **MM claimed-ticket rankings — {current_claim_month()}**\n\n" + "\n".join(lines)
+        f"📊 **MM claimed-ticket rankings — {current_claim_month()}**\n\n" + "\n".join(lines),
+        allowed_mentions=discord.AllowedMentions.none()
     )
 
 
