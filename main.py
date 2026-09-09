@@ -4204,7 +4204,11 @@ async def ticket_count(interaction: discord.Interaction):
     for index, (user_id, total) in enumerate(ranked, start=1):
         try:
             member = interaction.guild.get_member(int(user_id))
+            if member is None:
+                member = await interaction.guild.fetch_member(int(user_id))
         except (TypeError, ValueError):
+            member = None
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             member = None
         display_name = member.display_name if member else f"User {user_id}"
         lines.append(
