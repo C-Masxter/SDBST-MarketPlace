@@ -4213,7 +4213,7 @@ async def ticket_count(interaction: discord.Interaction):
             member = None
         display_name = member.display_name if member else f"User {user_id}"
         lines.append(
-            f"{index}. {display_name} has claimed **{int(total)}** ticket{'s' if int(total) != 1 else ''} this month"
+            f"{index}. __**{display_name}**__ has claimed **{int(total)}** ticket{'s' if int(total) != 1 else ''} this month"
         )
     await interaction.followup.send(
         f"📊 **MM claimed-ticket rankings — {current_claim_month()}**\n\n" + "\n".join(lines),
