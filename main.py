@@ -4256,24 +4256,43 @@ async def vouch_ticket(interaction: discord.Interaction, seller: discord.Member,
     config = await get_server_config(interaction.guild.id)
     vouch_channel_id = config.get("vouches_channel_id")
     try:
-        vouch_channel = interaction.guild.get_channel(int(vouch_channel_id)) if vouch_channel_id else None
+        channel_id = int(vouch_channel_id) if vouch_channel_id else 0
     except (TypeError, ValueError):
-        vouch_channel = None
-    if not vouch_channel:
-        await interaction.followup.send("❌ Configure a valid vouches channel in `/setup` first.", ephemeral=True)
+        channel_id = 0
+    vouch_channel = interaction.guild.get_channel(channel_id) if channel_id else None
+    if vouch_channel is None and channel_id:
+        try:
+            vouch_channel = await interaction.guild.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            print(f"[VOUCH CHANNEL LOOKUP] id={channel_id}: {e}")
+    if not isinstance(vouch_channel, discord.TextChannel):
+        await interaction.followup.send(
+            "❌ The configured vouches channel is missing or invalid. In `/setup` → Vouch Settings, enter the ID of a text channel.",
+            ephemeral=True
+        )
         return
     try:
         mm = interaction.guild.get_member(int(deal.get("claimed_by"))) if deal.get("claimed_by") else interaction.user
         amount = deal.get("price") or "the deal amount"
-        await interaction.followup.send(f"{seller.mention} {buyer.mention}\nThis middleman ticket has been completed.\nPlease leave a vouch for {mm.mention} in {vouch_channel.mention}.\n\nSample vouch format: `Vouch mm {mm.mention} {amount} deal fast and easy`")
-        timeout = int(config.get("vouch_timeout_seconds") or 86400)
+        await interaction.followup.send(
+            f"{seller.mention} {buyer.mention}\nThis middleman ticket has been completed.\n"
+            f"Please leave a vouch for {mm.mention} in {vouch_channel.mention}.\n\n"
+            f"Sample vouch format: `Vouch mm {mm.mention} {amount} deal fast and easy`"
+        )
+        try:
+            timeout = int(config.get("vouch_timeout_seconds") or 86400)
+        except (TypeError, ValueError):
+            timeout = 86400
         _vouch_state[deal_id] = {"deadline": time.time() + timeout, "participants": [str(seller.id), str(buyer.id)], "vouched": [], "blacklisted": [], "blacklist_role_id": str(config.get("blacklist_role_id") or "")}
         deal["state"] = "completed"
         save_vouch_state()
         save_mm_deals(_mm_deals)
     except Exception as e:
         print(f"[VOUCH COMMAND] deal={deal_id}: {e}")
-        await interaction.followup.send("❌ Vouch setup failed. Check that the bot can view and send messages in the vouches channel.", ephemeral=True)
+        await interaction.followup.send(
+            "❌ The vouch message could not be completed. Check the bot console for `[VOUCH COMMAND]` details.",
+            ephemeral=True
+        )
 
 class MMRoleButton(discord.ui.Button):
     def __init__(self, deal_id, role, label, emoji):
