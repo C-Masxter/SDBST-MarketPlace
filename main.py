@@ -1219,6 +1219,13 @@ def setup_authorized(interaction, config=None):
 def setup_denied_message():
     return "❌ Administrator permissions or the configured setup-admin role is required."
 
+
+async def refresh_setup_interaction(interaction, embed, view):
+    """Acknowledge slow setup saves before editing the ephemeral setup panel."""
+    if not interaction.response.is_done():
+        await interaction.response.defer()
+    await interaction.edit_original_response(embed=embed, view=view)
+
 def channel_default(guild, channel_id):
     """
     Turn a saved channel ID into a Discord default value
@@ -1593,6 +1600,9 @@ class StickyView(discord.ui.View):
         value
     ):
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+
         try:
 
             await api.patch_config(
@@ -1626,7 +1636,7 @@ class StickyView(discord.ui.View):
 
         try:
 
-            await interaction.response.edit_message(
+            await interaction.edit_original_response(
                 embed=refreshed.build_embed(),
                 view=refreshed
             )
@@ -1939,6 +1949,8 @@ class MMPanelSettingsView(discord.ui.View):
         )
 
     async def save(self, interaction, key, value):
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         try:
             await api.patch_config(interaction.guild.id, {key: str(value)})
             self.config[key] = str(value)
@@ -1954,7 +1966,7 @@ class MMPanelSettingsView(discord.ui.View):
             await safe_error(interaction, "❌ Couldn't save or post the MM panel.")
             return
         refreshed = MMPanelSettingsView(self.guild, self.config)
-        await interaction.response.edit_message(embed=refreshed.build_embed(), view=refreshed)
+        await interaction.edit_original_response(embed=refreshed.build_embed(), view=refreshed)
 
 
 class TierRoleSelect(discord.ui.RoleSelect):
@@ -2013,6 +2025,8 @@ class TierMembersView(discord.ui.View):
         )
 
     async def save(self, interaction, key, value):
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         try:
             await api.patch_config(interaction.guild.id, {key: value})
         except Exception as e:
@@ -2024,7 +2038,7 @@ class TierMembersView(discord.ui.View):
         save_bot_config(_bot_config)
         invalidate_config_cache(interaction.guild.id)
         refreshed = TierMembersView(self.guild, self.config)
-        await interaction.response.edit_message(embed=refreshed.build_embed(), view=refreshed)
+        await interaction.edit_original_response(embed=refreshed.build_embed(), view=refreshed)
 
 
 class TierMembersButton(discord.ui.Button):
@@ -2091,6 +2105,8 @@ class ChannelSettingsView(discord.ui.View):
         return channel_settings_embed(self.guild, self.config)
 
     async def save(self, interaction, key, value):
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         try:
             await api.patch_config(interaction.guild.id, {key: str(value)})
         except Exception as e:
@@ -2101,7 +2117,7 @@ class ChannelSettingsView(discord.ui.View):
         invalidate_config_cache(interaction.guild.id)
         refreshed = ChannelSettingsView(self.guild, self.config)
         try:
-            await interaction.response.edit_message(embed=refreshed.build_embed(), view=refreshed)
+            await interaction.edit_original_response(embed=refreshed.build_embed(), view=refreshed)
         except Exception as e:
             print(f"[CHANNEL REFRESH] {e}")
             await safe_error(interaction, "🟢 Channel settings updated.")
@@ -2155,6 +2171,8 @@ class NegotiationLogSettingsView(discord.ui.View):
         )
 
     async def save(self, interaction, key, value):
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         try:
             await api.patch_config(interaction.guild.id, {key: str(value)})
         except Exception as e:
@@ -2165,7 +2183,7 @@ class NegotiationLogSettingsView(discord.ui.View):
         _bot_config.setdefault(str(interaction.guild.id), {})[key] = str(value)
         invalidate_config_cache(interaction.guild.id)
         refreshed = NegotiationLogSettingsView(self.guild, self.config)
-        await interaction.response.edit_message(embed=refreshed.build_embed(), view=refreshed)
+        await interaction.edit_original_response(embed=refreshed.build_embed(), view=refreshed)
 
 
 class NegotiationLogButton(discord.ui.Button):
@@ -2394,6 +2412,9 @@ class SetupView(discord.ui.View):
         value
     ):
 
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+
         try:
 
             await api.patch_config(
@@ -2430,7 +2451,7 @@ class SetupView(discord.ui.View):
 
         try:
 
-            await interaction.response.edit_message(
+            await interaction.edit_original_response(
                 embed=refreshed.build_embed(),
                 view=refreshed
             )
@@ -3147,30 +3168,34 @@ class AdButtons(discord.ui.View):
                 )
             )
 
-        except discord.Forbidden:
-
-            await safe_error(
-                interaction,
-                (
-                    "❌ I don't have permission "
-                    "to create ticket channels."
+        except (discord.Forbidden, discord.HTTPException) as e:
+            # A Discord category can reject new children when it is full or
+            # has a conflicting overwrite. Retry at the server root so a
+            # configured category cannot permanently block ticket creation.
+            print(f"[CHANNEL CREATE IN CATEGORY] status={getattr(e, 'status', '?')} code={getattr(e, 'code', '?')} error={e}")
+            try:
+                ticket_channel = await guild.create_text_channel(
+                    name=ticket_name,
+                    overwrites=overwrites,
+                    topic=(
+                        f"SDBST Trade • "
+                        f"{self.ad.get('item')} • "
+                        f"{money(self.ad.get('price'))}"
+                    )
                 )
-            )
-
-            return
-
-        except discord.HTTPException as e:
-
-            print(
-                f"[CHANNEL CREATE] {e}"
-            )
-
-            await safe_error(
-                interaction,
-                "❌ Discord failed to create the ticket."
-            )
-
-            return
+                print(f"[CHANNEL CREATE FALLBACK] Created {ticket_channel} outside the configured category.")
+            except (discord.Forbidden, discord.HTTPException) as fallback_error:
+                print(f"[CHANNEL CREATE FALLBACK FAILED] status={getattr(fallback_error, 'status', '?')} code={getattr(fallback_error, 'code', '?')} error={fallback_error}")
+                await safe_error(
+                    interaction,
+                    (
+                        "❌ Discord rejected ticket creation. "
+                        f"status={getattr(fallback_error, 'status', '?')}, "
+                        f"code={getattr(fallback_error, 'code', '?')}. "
+                        "Check the bot role and server/category channel limits."
+                    )
+                )
+                return
 
         # ----------------------------------------------------
         # Save ticket to backend
@@ -5034,13 +5059,27 @@ async def mm(interaction: discord.Interaction):
             overwrites=overwrites,
             topic=f"SDBST Middleman Ticket • {interaction.user}"
         )
-    except discord.Forbidden:
-        await interaction.followup.send("❌ I don't have permission to create ticket channels.", ephemeral=True)
-        return
-    except discord.HTTPException as e:
-        print(f"[MM CHANNEL] {e}")
-        await interaction.followup.send("❌ Discord failed to create the ticket.", ephemeral=True)
-        return
+    except (discord.Forbidden, discord.HTTPException) as e:
+        print(f"[MM CHANNEL CREATE IN CATEGORY] status={getattr(e, 'status', '?')} code={getattr(e, 'code', '?')} error={e}")
+        try:
+            ticket_channel = await interaction.guild.create_text_channel(
+                name=channel_name,
+                overwrites=overwrites,
+                topic=f"SDBST Middleman Ticket • {interaction.user}"
+            )
+            print(f"[MM CHANNEL FALLBACK] Created {ticket_channel} outside the configured category.")
+        except (discord.Forbidden, discord.HTTPException) as fallback_error:
+            print(f"[MM CHANNEL FALLBACK FAILED] status={getattr(fallback_error, 'status', '?')} code={getattr(fallback_error, 'code', '?')} error={fallback_error}")
+            await interaction.followup.send(
+                (
+                    "❌ Discord rejected MM ticket creation. "
+                    f"status={getattr(fallback_error, 'status', '?')}, "
+                    f"code={getattr(fallback_error, 'code', '?')}. "
+                    "Check the bot role and server/category channel limits."
+                ),
+                ephemeral=True
+            )
+            return
     deal_id = uuid.uuid4().hex[:8]
     claim_msg = None
     select_embed = discord.Embed(
