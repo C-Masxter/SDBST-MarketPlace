@@ -1,6 +1,6 @@
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import time
 import asyncio
@@ -409,7 +409,9 @@ async def next_mm_ticket_number(guild_id):
 
 
 def current_claim_month():
-    return datetime.now(timezone.utc).strftime("%Y-%m")
+    # The server requested fixed EST: five hours behind UTC.
+    est = timezone(timedelta(hours=-5))
+    return datetime.now(est).strftime("%Y-%m")
 
 
 def record_mm_claim(guild_id, user_id):
@@ -4040,7 +4042,7 @@ async def ticket_count(interaction: discord.Interaction):
         for index, (user_id, total) in enumerate(ranked, start=1)
     ]
     await interaction.response.send_message(
-        f"📊 **MM claimed-ticket rankings — {current_claim_month()}**\n" + "\n".join(lines)
+        f"📊 **MM claimed-ticket rankings — {current_claim_month()}**\n\n" + "\n".join(lines)
     )
 
 
