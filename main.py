@@ -453,7 +453,7 @@ def get_mm_claim_counts(guild_id):
 
 def mm_step(step, title, next_step=None):
     """Format a compact, consistent progress header for MM prompts."""
-    text = f"**Step {step}/5 • {title}**"
+    text = f"**🤝 Step {step}/3 • {title}**"
     if next_step:
         text += f"\n{MM_FLOW_DIVIDER}\n**Next:** {next_step}"
     return text
@@ -839,7 +839,7 @@ def mm_deal_embed(deal):
         lines.append(f"{name}: {status}")
 
     progress = (
-        mm_step(5, "Confirm the deal", "Both traders press Confirm Deal to finish.")
+        mm_step(3, "Confirm the deal", "Both traders press Confirm Deal to finish.")
         if deal.get("state") == "confirming_usd"
         else None
     )
@@ -854,7 +854,7 @@ def mm_deal_embed(deal):
 
     buyer_id = next((str(uid) for uid, role in deal.get("roles", {}).items() if role == "buyer"), None)
     seller_id = next((str(uid) for uid, role in deal.get("roles", {}).items() if role == "seller"), None)
-    embed_title = "🟦 Step 5/5 • Confirm Deal" if deal.get("state") == "confirming_usd" else "ENTER DEAL DETAILS"
+    embed_title = "🤝 Step 3/3 • Confirm Deal" if deal.get("state") == "confirming_usd" else "ENTER DEAL DETAILS"
     embed = discord.Embed(title=embed_title, description=description, color=MM_LIGHT_BLUE)
     embed.add_field(name="Buyer", value=f"<@{buyer_id}>" if buyer_id else "—", inline=True)
     embed.add_field(name="Seller", value=f"<@{seller_id}>" if seller_id else "—", inline=True)
@@ -3548,26 +3548,15 @@ class TicketButtons(discord.ui.View):
 
             return
 
-        await interaction.response.send_message("🔒 Closing ticket...", ephemeral=True)
-        _closed_ticket_channels.add(interaction.channel.id)
+        await interaction.response.send_message("🔒 Deleting negotiation ticket...", ephemeral=True)
         try:
             await api.close_ticket(self.ticket["ticket_id"])
         except Exception as e:
             print(f"[CLOSE TICKET API] {e}")
-        guild = interaction.guild
-        await restrict_closed_ticket_channel(
-            interaction.channel,
-            guild,
-            (buyer_id, seller_id)
-        )
         try:
-            await interaction.message.edit(view=ClosedTicketView(self.ticket))
+            await interaction.channel.delete(reason=f"Negotiation ticket closed by {interaction.user}")
         except Exception as e:
-            print(f"[CLOSE TICKET EDIT] {e}")
-        try:
-            await interaction.channel.send("🔒 This ticket has been closed. Staff can reopen or delete it.")
-        except Exception:
-            pass
+            print(f"[CLOSE TICKET DELETE] {e}")
 
 
     
@@ -3901,6 +3890,36 @@ def mm_staff_or_claimed(interaction, deal):
     return bool(role_ids.intersection({str(r.id) for r in getattr(interaction.user, "roles", [])}))
 
 
+async def apply_claimed_mm_chat_permissions(channel, guild, deal):
+    """Make MM/support roles read-only after a ticket is claimed."""
+    read_only = discord.PermissionOverwrite(
+        view_channel=True,
+        send_messages=False,
+        read_message_history=True
+    )
+    for raw_role_id in deal.get("tier_role_ids", []):
+        try:
+            role = guild.get_role(int(raw_role_id))
+            if role:
+                await channel.set_permissions(role, overwrite=read_only)
+        except (TypeError, ValueError, discord.HTTPException) as e:
+            print(f"[MM CLAIM ROLE CHAT PERMS] {e}")
+    participant_ids = {str(uid) for uid in deal.get("participants", [])}
+    if deal.get("claimed_by"):
+        participant_ids.add(str(deal["claimed_by"]))
+    participant_access = discord.PermissionOverwrite(
+        view_channel=True,
+        send_messages=True,
+        read_message_history=True
+    )
+    for raw_user_id in participant_ids:
+        try:
+            member = guild.get_member(int(raw_user_id)) or await guild.fetch_member(int(raw_user_id))
+            await channel.set_permissions(member, overwrite=participant_access)
+        except (TypeError, ValueError, discord.HTTPException) as e:
+            print(f"[MM CLAIM MEMBER CHAT PERMS] {e}")
+
+
 async def create_mm_transcript(interaction, deal):
     """Create and post a plain-text MM transcript to the configured log channel."""
     config = await get_server_config(interaction.guild.id)
@@ -4046,6 +4065,7 @@ class MMClaimButton(discord.ui.Button):
             deal["claimed_by"] = str(interaction.user.id)
             record_mm_claim(interaction.guild.id, interaction.user.id)
         save_mm_deals(_mm_deals)
+        await apply_claimed_mm_chat_permissions(interaction.channel, interaction.guild, deal)
         embed = (
             interaction.message.embeds[0]
             if interaction.message.embeds
@@ -4274,9 +4294,9 @@ class MMRoleButton(discord.ui.Button):
                 deal["state"] = "confirming_roles"
                 save_mm_deals(_mm_deals)
                 embed = discord.Embed(
-                    title="✅ Step 3/5 • Confirm Roles",
+                    title="🤝 Step 2/3 • Confirm Roles",
                     description=(
-                        mm_step(3, "Confirm Buyer / Seller", "Both traders press Correct to continue.")
+                        mm_step(2, "Confirm Buyer / Seller", "Both traders press Correct to continue.")
                         + "\n\n" + role_summary(deal)
                     ),
                     color=MM_LIGHT_BLUE
@@ -4368,13 +4388,13 @@ class MMRoleDecisionButton(discord.ui.Button):
                 deal["state"] = "awaiting_offer"
                 save_mm_deals(_mm_deals)
                 next_embed = role_confirmation_embed(deal)
-                next_embed.title = "📝 Step 4/5 • Enter Deal Details"
+                next_embed.title = "🤝 Step 3/3 • Enter Deal Details"
                 next_embed.description = (
-                    mm_step(4, "Enter deal details", "The Buyer clicks Enter Deal and fills in the trade information.")
+                    mm_step(3, "Enter deal details", "Either the Buyer or Seller can enter the trade information.")
                     + "\n\n" + role_summary(deal)
                 )
                 await interaction.message.edit(embed=next_embed, view=MMOfferEntryView(self.deal_id))
-                await interaction.followup.send("🟢 Step 4 started: the Buyer can click Enter Deal.", ephemeral=True)
+                await interaction.followup.send("🟢 Step 3 started: either participant can enter the deal details.", ephemeral=True)
             else:
                 save_mm_deals(_mm_deals)
                 await interaction.message.edit(embed=role_confirmation_embed(deal), view=MMRoleConfirmView(self.deal_id))
@@ -4388,8 +4408,8 @@ class MMOfferEntryButton(discord.ui.Button):
     async def callback(self, interaction):
         deal = _mm_deals.get(self.deal_id)
         buyer_id = str(deal.get("offer_modal_user_id")) if deal else None
-        if not deal or str(interaction.user.id) != buyer_id:
-            await safe_error(interaction, "❌ Only the Buyer can enter the offer/value.")
+        if not deal or str(interaction.user.id) not in {str(uid) for uid in deal.get("participants", [])}:
+            await safe_error(interaction, "❌ Only the Buyer or Seller can enter the deal details.")
             return
         deal["state"] = "entering_deal"
         save_mm_deals(_mm_deals)
@@ -4425,7 +4445,7 @@ def role_summary(deal):
 
 def role_selection_embed(deal):
     return discord.Embed(
-        title="🧭 Step 2/5 • Choose Buyer or Seller",
+        title="🤝 Step 2/3 • Choose Buyer or Seller",
         description=(
             mm_step(2, "Choose your role", "Both traders select Buyer or Seller below.")
             + "\n\n"
@@ -4445,9 +4465,9 @@ def role_confirmation_embed(deal):
     if waiting_users:
         status += "\nWaiting for " + ", ".join(waiting_users) + "."
     return discord.Embed(
-        title="✅ Step 3/5 • Confirm Roles",
+        title="🤝 Step 2/3 • Confirm Roles",
         description=(
-            mm_step(3, "Confirm Buyer / Seller", "Both traders press Correct to continue.")
+            mm_step(2, "Confirm Buyer / Seller", "Both traders press Correct to continue.")
             + f"\n\n{role_summary(deal)}\n\n"
             "Please confirm that the Buyer and Seller roles are correct.\n\n"
             f"{status}"
@@ -4548,7 +4568,7 @@ async def route_mm_for_deal(interaction, deal_id, tier):
         try:
             role = interaction.guild.get_role(int(raw_id))
             if role:
-                await interaction.channel.set_permissions(role, view_channel=True, send_messages=True, read_message_history=True)
+                await interaction.channel.set_permissions(role, view_channel=True, send_messages=False, read_message_history=True)
                 invited_roles.append(role)
         except (TypeError, ValueError, discord.HTTPException):
             continue
@@ -4956,8 +4976,10 @@ class MMCloseButton(discord.ui.Button):
         }
         if deal.get("creator_id"):
             allowed_participants.add(str(deal["creator_id"]))
+        if deal.get("claimed_by"):
+            allowed_participants.add(str(deal["claimed_by"]))
         if str(interaction.user.id) not in allowed_participants:
-            await safe_error(interaction, "❌ Only the two participants can close this ticket.")
+            await safe_error(interaction, "❌ Only the Buyer, Seller, or claimed MM can close this ticket.")
             return
         await close_mm_deal(interaction, self.deal_id, deal)
 
@@ -5034,7 +5056,7 @@ async def mm(interaction: discord.Interaction):
         await safe_error(interaction, "❌ This command must be used inside a server.")
         return
     config = await get_server_config(interaction.guild.id)
-    category_id = config.get("ticket_category_id")
+    category_id = config.get("mm_ticket_category_id") or config.get("ticket_category_id")
     if not category_id:
         await safe_error(interaction, "❌ Tickets aren't configured. Ask an admin to run `/setup`.")
         return
