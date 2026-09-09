@@ -371,6 +371,7 @@ def mm_flow_lock(deal_id):
 MM_LIGHT_BLUE = discord.Color.from_rgb(110, 190, 255)
 MM_FLOW_DIVIDER = "━━━━━━━━━━━━━━━━━━━━"
 MAX_OPEN_TICKETS_PER_USER = 20
+MM_TICKET_COUNTER_START = 8000
 MM_TICKET_COUNTER_FILE = Path("mm_ticket_counter.json")
 MM_CLAIM_COUNTS_FILE = Path("mm_claim_counts.json")
 
@@ -400,7 +401,8 @@ _mm_counter_lock = asyncio.Lock()
 async def next_mm_ticket_number(guild_id):
     async with _mm_counter_lock:
         key = str(guild_id)
-        number = max(int(_mm_ticket_counters.get(key, 8000) or 8000) + 1, 8001)
+        current = int(_mm_ticket_counters.get(key, MM_TICKET_COUNTER_START - 1) or (MM_TICKET_COUNTER_START - 1))
+        number = max(current + 1, MM_TICKET_COUNTER_START)
         _mm_ticket_counters[key] = number
         _save_json_file(MM_TICKET_COUNTER_FILE, _mm_ticket_counters)
         return number
@@ -4635,29 +4637,33 @@ class MMRoutingView(discord.ui.View):
 class EnterDealModal(discord.ui.Modal):
 
     def __init__(self, deal_id, existing=None):
-        super().__init__(title="Enter Deal")
+        is_edit = bool(existing)
+        super().__init__(title="Edit Deal" if is_edit else "Enter Deal")
         self.deal_id = deal_id
         existing = existing or {}
+        item_default = str(existing.get("item") or "")[:100]
+        price_default = str(existing.get("price") or "")[:20]
+        payment_default = str(existing.get("payment_method") or "")[:50]
         self.item_input = discord.ui.TextInput(
             label="Item Name",
             placeholder="Example: Item, Price, Payment Method",
             max_length=100,
             required=True,
-            default=str(existing.get("item", ""))
+            default=item_default
         )
         self.price_input = discord.ui.TextInput(
             label="Offer",
             placeholder="Price",
             max_length=20,
             required=True,
-            default=str(existing.get("price", ""))
+            default=price_default
         )
         self.payment_input = discord.ui.TextInput(
             label="Payment Method",
             placeholder="Payment Method",
             max_length=50,
             required=False,
-            default=str(existing.get("payment_method", ""))
+            default=payment_default
         )
         self.add_item(self.item_input)
         self.add_item(self.price_input)
@@ -4677,6 +4683,8 @@ class EnterDealModal(discord.ui.Modal):
         deal["price"] = str(price)
         deal["payment_method"] = self.payment_input.value.strip() or "Not selected"
         deal["confirmed"] = {str(uid): False for uid in deal.get("participants", [])}
+        deal["usd_confirmed"] = {str(uid): False for uid in deal.get("participants", [])}
+        deal["usd_routing_value"] = None
         deal["state"] = "confirming"
         save_mm_deals(_mm_deals)
         embed = mm_deal_embed(deal)
