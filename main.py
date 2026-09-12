@@ -454,9 +454,9 @@ def get_mm_claim_counts(guild_id):
 def mm_step(step, title, next_step=None):
     """Format a compact, consistent progress header for MM prompts."""
     emoji = "📝" if int(step) == 3 else "🤝"
-    text = f"**{emoji} Step {step}/3 • {title}**"
+    text = f"**{emoji} Step {step}/3 — {title}**"
     if next_step:
-        text += f"\n{MM_FLOW_DIVIDER}\n**Next:** {next_step}"
+        text += f"\n{next_step}"
     return text
 
 
@@ -550,6 +550,38 @@ def is_negotiation_channel(channel, config=None):
         str(deal.get("ticket_channel_id")) == channel_id
         for deal in _mm_deals.values()
     )
+
+
+async def notify_trade_participant(message):
+    """Temporarily notify the other trader when a buyer or seller posts."""
+    try:
+        tickets = await api.list_tickets(message.guild.id)
+        ticket = next(
+            (
+                item for item in tickets
+                if str(item.get("channel_id")) == str(message.channel.id)
+                and item.get("status", "open") == "open"
+            ),
+            None,
+        )
+        if not ticket:
+            return
+
+        author_id = str(message.author.id)
+        buyer_id = str(ticket.get("buyer_id"))
+        seller_id = str(ticket.get("seller_id"))
+        if author_id == buyer_id:
+            recipient_id = seller_id
+        elif author_id == seller_id:
+            recipient_id = buyer_id
+        else:
+            return
+
+        if not recipient_id or recipient_id == "None":
+            return
+        await temporary_mm_ping(message.channel, f"<@{recipient_id}>", delay=3.0)
+    except Exception as e:
+        print(f"[TRADE PARTICIPANT PING] {e}")
 
 
 async def log_negotiation_event(message, config, event="MESSAGE"):
@@ -840,7 +872,7 @@ def mm_deal_embed(deal):
         lines.append(f"{name}: {status}")
 
     progress = (
-        mm_step(3, "Confirm the deal", "Both traders press Confirm Deal to finish.")
+        mm_step(3, "Confirm the deal", "Click Confirm Deal if correct.")
         if deal.get("state") == "confirming_usd"
         else None
     )
@@ -848,9 +880,7 @@ def mm_deal_embed(deal):
         ((progress + "\n\n") if progress else "")
         + f"**{header}**\n\n"
         + "\n".join(lines)
-        + "\n\nPlease confirm the trade by pressing the "
-        "'Confirm' button below. If this deal is not "
-        "accurate, please click 'Edit Deal'"
+        + "\n\nClick Confirm Deal if correct, or Edit Deal to change it."
     )
 
     buyer_id = next((str(uid) for uid, role in deal.get("roles", {}).items() if role == "buyer"), None)
@@ -4364,7 +4394,7 @@ class MMRoleButton(discord.ui.Button):
                 embed = discord.Embed(
                     title="🤝 Step 2/3 • Confirm Roles",
                     description=(
-                        mm_step(2, "Confirm Buyer / Seller", "Both traders press Correct to continue.")
+                        mm_step(2, "Confirm roles", "Click Correct if the roles are correct.")
                         + "\n\n" + role_summary(deal)
                     ),
                     color=MM_LIGHT_BLUE
@@ -4458,7 +4488,7 @@ class MMRoleDecisionButton(discord.ui.Button):
                 next_embed = role_confirmation_embed(deal)
                 next_embed.title = "📝 Step 3/3 • Enter Deal Details"
                 next_embed.description = (
-                    mm_step(3, "Enter deal details", "Either the Buyer or Seller can enter the trade information.")
+                    mm_step(3, "Enter deal details", "Click Enter Deal and fill in the details.")
                     + "\n\n" + role_summary(deal)
                 )
                 await interaction.message.edit(embed=next_embed, view=MMOfferEntryView(self.deal_id))
@@ -4515,10 +4545,10 @@ def role_selection_embed(deal):
     return discord.Embed(
         title="🤝 Step 2/3 • Choose Buyer or Seller",
         description=(
-            mm_step(2, "Choose your role", "Both traders select Buyer or Seller below.")
+            mm_step(2, "Choose your role", "Select Buyer or Seller below.")
             + "\n\n"
-            "**Buyer** if you are buying or paying for the item.\n"
-            "**Seller** if you are selling or providing the item.\n\n"
+            "Choose **Buyer** if you are paying.\n"
+            "Choose **Seller** if you are providing the item.\n\n"
             + role_summary(deal)
         ),
         color=MM_LIGHT_BLUE
@@ -4535,9 +4565,9 @@ def role_confirmation_embed(deal):
     return discord.Embed(
         title="🤝 Step 2/3 • Confirm Roles",
         description=(
-            mm_step(2, "Confirm Buyer / Seller", "Both traders press Correct to continue.")
+            mm_step(2, "Confirm roles", "Click Correct if the roles are correct.")
             + f"\n\n{role_summary(deal)}\n\n"
-            "Please confirm that the Buyer and Seller roles are correct.\n\n"
+            "Click Correct if the Buyer and Seller roles are correct.\n\n"
             f"{status}"
         ),
         color=MM_LIGHT_BLUE
@@ -5183,8 +5213,8 @@ async def mm(interaction: discord.Interaction):
     select_embed = discord.Embed(
         title="🤝 Middleman Trade Setup",
         description=(
-            mm_step(1, "Choose the other trader", "Select the person you are trading with below.")
-            + "\n\nSearch up another user's username in the search box and select them from the drop-down."
+            mm_step(1, "Choose the other trader", "Select the trader below.")
+            + "\n\nSelect the other trader from the list."
         ),
         color=MM_LIGHT_BLUE
     )
@@ -5651,8 +5681,8 @@ async def on_guild_channel_create(channel):
     select_embed = discord.Embed(
         title="🤝 Middleman Trade Setup",
         description=(
-            mm_step(1, "Choose the other trader", "Select the person you are trading with below.")
-            + "\n\nSearch up another user's username in the search box and select them from the drop-down."
+            mm_step(1, "Choose the other trader", "Select the trader below.")
+            + "\n\nSelect the other trader from the list."
         ),
         color=discord.Color.blue()
     )
@@ -5737,6 +5767,7 @@ async def on_message(message):
         save_inactivity_state()
         _negotiation_message_cache[message.id] = message
         await log_negotiation_event(message, config, "MESSAGE")
+        await notify_trade_participant(message)
 
     # ----------------------------------------------------
     # Closed ticket: users cannot view or send messages.
