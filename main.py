@@ -579,7 +579,11 @@ async def notify_trade_participant(message):
 
         if not recipient_id or recipient_id == "None":
             return
-        await temporary_mm_ping(message.channel, f"<@{recipient_id}>", delay=3.0)
+        await temporary_mm_ping(
+            message.channel,
+            f"<@{recipient_id}>\nYou’ve received a response on your trade.",
+            delay=3.0
+        )
     except Exception as e:
         print(f"[TRADE PARTICIPANT PING] {e}")
 
@@ -4388,18 +4392,19 @@ class MMRoleButton(discord.ui.Button):
             deal["roles"] = roles
             participants = [str(uid) for uid in deal.get("participants", [])]
             if len(roles) == 2 and len(set(roles.values())) == 2 and len(participants) >= 2:
-                deal["role_confirmed"] = {uid: False for uid in participants}
-                deal["state"] = "confirming_roles"
+                # Role selection is complete; intentionally skip the old role
+                # confirmation screen and proceed directly to deal details.
+                buyer_id = next((str(uid) for uid, role in roles.items() if role == "buyer"), None)
+                deal["offer_modal_user_id"] = buyer_id
+                deal["state"] = "awaiting_offer"
                 save_mm_deals(_mm_deals)
-                embed = discord.Embed(
-                    title="🤝 Step 2/3 • Confirm Roles",
-                    description=(
-                        mm_step(2, "Confirm roles", "Click Correct if the roles are correct.")
-                        + "\n\n" + role_summary(deal)
-                    ),
-                    color=MM_LIGHT_BLUE
+                next_embed = role_selection_embed(deal)
+                next_embed.title = "📝 Step 3/3 • Enter Deal Details"
+                next_embed.description = (
+                    mm_step(3, "Enter deal details", "Click Enter Deal and fill in the details.")
+                    + "\n\n" + role_summary(deal)
                 )
-                await interaction.message.edit(embed=embed, view=MMRoleConfirmView(self.deal_id))
+                await interaction.message.edit(embed=next_embed, view=MMOfferEntryView(self.deal_id))
             else:
                 deal["state"] = "selecting_roles"
                 save_mm_deals(_mm_deals)
@@ -4643,7 +4648,6 @@ class MMSelectUserView(discord.ui.View):
         super().__init__(timeout=None)
         self.deal_id = deal_id
         self.add_item(MMUserSelect(deal_id))
-        self.add_item(MMCloseButton(deal_id))
 
 
 async def route_mm_for_deal(interaction, deal_id, tier):
@@ -5211,11 +5215,8 @@ async def mm(interaction: discord.Interaction):
     deal_id = uuid.uuid4().hex[:8]
     claim_msg = None
     select_embed = discord.Embed(
-        title="🤝 Middleman Trade Setup",
-        description=(
-            mm_step(1, "Choose the other trader", "Select the trader below.")
-            + "\n\nSelect the other trader from the list."
-        ),
+        title="SDBST MM System",
+        description="Please select your trade partner in the box below.",
         color=MM_LIGHT_BLUE
     )
     try:
@@ -5242,6 +5243,13 @@ async def mm(interaction: discord.Interaction):
         "tier_role_ids": [str(role.id) for role in tier_roles]
     }
     save_mm_deals(_mm_deals)
+    asyncio.create_task(
+        delayed_mm_ping(
+            ticket_channel,
+            f"{interaction.user.mention} Your MM ticket is ready: {ticket_channel.mention}",
+            users=True,
+        )
+    )
     if select_msg:
         await interaction.followup.send(f"🎫 MM ticket created {ticket_channel.mention}", ephemeral=True)
     else:
@@ -5679,11 +5687,8 @@ async def on_guild_channel_create(channel):
     deal_id = uuid.uuid4().hex[:8]
 
     select_embed = discord.Embed(
-        title="🤝 Middleman Trade Setup",
-        description=(
-            mm_step(1, "Choose the other trader", "Select the trader below.")
-            + "\n\nSelect the other trader from the list."
-        ),
+        title="SDBST MM System",
+        description="Please select your trade partner in the box below.",
         color=discord.Color.blue()
     )
 
@@ -5720,6 +5725,15 @@ async def on_guild_channel_create(channel):
     }
 
     save_mm_deals(_mm_deals)
+
+    if opener:
+        asyncio.create_task(
+            delayed_mm_ping(
+                channel,
+                f"<@{opener.id}> Your MM ticket is ready: {channel.mention}",
+                users=True,
+            )
+        )
 
     print(
         f"[MM AUTODETECT] Started deal {deal_id} "
