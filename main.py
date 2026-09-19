@@ -5121,6 +5121,240 @@ class DealConfirmView(discord.ui.View):
 
 
 # ============================================================
+# MM TICKET INTAKE (plain-message conversation)
+# ============================================================
+# Flow (no embeds, no buttons except the MM claim control):
+#   1. bot asks the opener who they are trading with
+#   2. bot asks if the opener is buyer or seller
+#   3. bot asks what the deal is
+#   4. bot invites the MM team (claimable) with the deal info
+#   5. bot invites the other trader and asks them to confirm
+
+
+def find_deal_for_channel(channel_id):
+    for deal_id, deal in _mm_deals.items():
+        if str(deal.get("ticket_channel_id")) == str(channel_id):
+            return deal_id, deal
+    return None, None
+
+
+def mm_team_mentions(guild, deal):
+    mentions = []
+    for raw_id in deal.get("tier_role_ids") or []:
+        try:
+            role = guild.get_role(int(raw_id))
+        except (TypeError, ValueError):
+            role = None
+        if role:
+            mentions.append(role.mention)
+    return " ".join(mentions) or "the configured MM team"
+
+
+async def resolve_partner_member(guild, text):
+    text = (text or "").strip()
+    if not text:
+        return None
+    match = re.search(r"<@!?(\d+)>", text)
+    raw_id = match.group(1) if match else (text if text.isdigit() else None)
+    if raw_id:
+        member = guild.get_member(int(raw_id))
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(raw_id))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                member = None
+        return member
+    lowered = text.lstrip("@").strip().lower()
+    if not lowered:
+        return None
+    for member in guild.members:
+        names = {
+            (member.name or "").lower(),
+            (getattr(member, "global_name", None) or "").lower(),
+            (member.display_name or "").lower(),
+        }
+        if lowered in names:
+            return member
+    try:
+        results = await guild.query_members(query=lowered, limit=5)
+    except Exception as e:
+        print(f"[MM INTAKE MEMBER QUERY] {e}")
+        results = []
+    for member in results:
+        names = {
+            (member.name or "").lower(),
+            (getattr(member, "global_name", None) or "").lower(),
+            (member.display_name or "").lower(),
+        }
+        if lowered in names:
+            return member
+    return results[0] if results else None
+
+
+async def start_mm_intake(channel, deal_id, deal):
+    """Ask the ticket opener for the basic deal info, as plain messages."""
+    deal["intake"] = {"step": "partner"}
+    deal["state"] = "intake"
+    save_mm_deals(_mm_deals)
+    creator_id = deal.get("creator_id")
+    mention = f"<@{creator_id}>" if creator_id else ""
+    allowed = discord.AllowedMentions(users=True, roles=False, everyone=False)
+    try:
+        await channel.send(
+            f"{mention} we need some basic info before a middleman can claim your ticket.",
+            allowed_mentions=allowed,
+        )
+        await channel.send(
+            f"{mention} who are you trading with? Send their Discord username, ID, or ping them.",
+            allowed_mentions=allowed,
+        )
+    except Exception as e:
+        print(f"[MM INTAKE START] {e}")
+
+
+async def finish_mm_intake(channel, deal_id, deal):
+    guild = channel.guild
+    creator_id = str(deal.get("creator_id"))
+    partner_id = str(deal.get("partner_id"))
+    creator_role = deal.get("creator_role") or "buyer"
+    buyer_id = creator_id if creator_role == "buyer" else partner_id
+    seller_id = partner_id if creator_role == "buyer" else creator_id
+    deal_text = deal.get("deal_text") or "—"
+
+    deal["buyer_id"] = buyer_id
+    deal["seller_id"] = seller_id
+    deal["roles"] = {buyer_id: "buyer", seller_id: "seller"}
+    deal["item"] = deal_text
+    deal["participants"] = [creator_id, partner_id]
+    deal["state"] = "mm_available"
+    deal["intake"] = {"step": "done"}
+    save_mm_deals(_mm_deals)
+
+    allowed = discord.AllowedMentions(users=True, roles=True, everyone=False)
+    team = mm_team_mentions(guild, deal)
+    info = (
+        f"{team} you can middleman this deal now.\n"
+        f"Buyer: <@{buyer_id}>\n"
+        f"Seller: <@{seller_id}>\n"
+        f"Deal: {deal_text}"
+    )
+    try:
+        claim_msg = await channel.send(
+            content=info,
+            view=MMClaimView(deal_id),
+            allowed_mentions=allowed,
+        )
+        deal["claim_message_id"] = str(claim_msg.id)
+        save_mm_deals(_mm_deals)
+        bot.add_view(MMClaimView(deal_id), message_id=claim_msg.id)
+    except Exception as e:
+        print(f"[MM INTAKE CLAIM MESSAGE] {e}")
+
+    # Invite the other trader to the ticket.
+    partner = guild.get_member(int(partner_id)) if partner_id.isdigit() else None
+    if partner is None and partner_id.isdigit():
+        try:
+            partner = await guild.fetch_member(int(partner_id))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            partner = None
+    if partner is not None:
+        try:
+            await channel.set_permissions(
+                partner,
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+            )
+        except Exception as e:
+            print(f"[MM INTAKE INVITE] {e}")
+    try:
+        await channel.send(
+            f"<@{partner_id}> reply `confirm` if the deal: {deal_text} is correct.",
+            allowed_mentions=allowed,
+        )
+    except Exception as e:
+        print(f"[MM INTAKE CONFIRM PROMPT] {e}")
+
+
+async def handle_mm_intake_message(message):
+    """Handle one step of the MM intake conversation.
+
+    Returns True when the message was consumed by the intake flow.
+    Runs directly from on_message so it never waits on the update loop.
+    """
+    if message.guild is None or message.author.bot:
+        return False
+    deal_id, deal = find_deal_for_channel(message.channel.id)
+    if not deal:
+        return False
+    intake = deal.get("intake") or {}
+    step = intake.get("step")
+    if step not in ("partner", "role", "deal"):
+        return False
+    if str(message.author.id) != str(deal.get("creator_id")):
+        return False
+    content = (message.content or "").strip()
+    if not content:
+        return False
+
+    allowed = discord.AllowedMentions(users=True, roles=False, everyone=False)
+    async with mm_flow_lock(deal_id):
+        intake = deal.get("intake") or {}
+        step = intake.get("step")
+        if step == "partner":
+            member = await resolve_partner_member(message.guild, content)
+            if member is None or member.bot or str(member.id) == str(message.author.id):
+                await message.channel.send(
+                    f"{message.author.mention} I couldn't find that user. "
+                    "Send their ping, user ID, or exact Discord username.",
+                    allowed_mentions=allowed,
+                )
+                return True
+            deal["partner_id"] = str(member.id)
+            deal.setdefault("names", {})[str(member.id)] = member.display_name or member.name
+            intake["step"] = "role"
+            deal["intake"] = intake
+            save_mm_deals(_mm_deals)
+            await message.channel.send(
+                f"{message.author.mention} are you the buyer or the seller?",
+                allowed_mentions=allowed,
+            )
+            return True
+
+        if step == "role":
+            lowered = content.lower()
+            if "buy" in lowered:
+                role = "buyer"
+            elif "sell" in lowered:
+                role = "seller"
+            else:
+                await message.channel.send(
+                    f"{message.author.mention} please reply with `buyer` or `seller`.",
+                    allowed_mentions=allowed,
+                )
+                return True
+            deal["creator_role"] = role
+            intake["step"] = "deal"
+            deal["intake"] = intake
+            save_mm_deals(_mm_deals)
+            await message.channel.send(
+                f"{message.author.mention} what's the deal?",
+                allowed_mentions=allowed,
+            )
+            return True
+
+        if step == "deal":
+            deal["deal_text"] = content
+            intake["step"] = "done"
+            deal["intake"] = intake
+            save_mm_deals(_mm_deals)
+            await finish_mm_intake(message.channel, deal_id, deal)
+            return True
+
+    return False
+
+
+# ============================================================
 # /MM
 # ============================================================
 
@@ -5219,20 +5453,7 @@ async def mm(interaction: discord.Interaction):
     }
     save_mm_deals(_mm_deals)
 
-    status = (
-        f"{interaction.user.mention}\n\n"
-        f"{mm_mentions}\n"
-        "MM ticket created. An available middleman can claim it now.\n"
-        f"Buyer and seller can be selected later with `/ps` and `/vouch`."
-    )
-    claim_msg = await ticket_channel.send(
-        content=status,
-        view=MMClaimView(deal_id),
-        allowed_mentions=discord.AllowedMentions(users=True, roles=True),
-    )
-    _mm_deals[deal_id]["claim_message_id"] = str(claim_msg.id)
-    save_mm_deals(_mm_deals)
-    bot.add_view(MMClaimView(deal_id), message_id=claim_msg.id)
+    await start_mm_intake(ticket_channel, deal_id, _mm_deals[deal_id])
     await interaction.followup.send(f"🎫 MM ticket created {ticket_channel.mention}", ephemeral=True)
 
 
@@ -5643,10 +5864,8 @@ async def on_guild_channel_create(channel):
         _pending_mm_channels.discard(key)
         return
 
-    # Give the ticket bot a moment to finish setting up
-    # the ticket (overwrites, opener, welcome message)
-    # before we post the deal flow.
-    await asyncio.sleep(2)
+    # No blocking delay here: the intake conversation is
+    # handled live in on_message, so we post immediately.
 
     # Tickety may not grant our bot access to the ticket
     # channel by default, so make sure we can see and
@@ -5699,21 +5918,11 @@ async def on_guild_channel_create(channel):
         "tier_role_ids": [str(role.id) for role in tier_roles],
     }
 
-    team_mentions = " ".join(f"<@&{role.id}>" for role in tier_roles) or "the configured MM team"
-    opener_mention = f"<@{opener.id}>" if opener else ""
-    status = f"{opener_mention}\n\n{team_mentions}\nMM ticket detected. An available middleman can claim it now."
-    try:
-        claim_msg = await channel.send(
-            content=status,
-            view=MMClaimView(deal_id),
-            allowed_mentions=discord.AllowedMentions(users=True, roles=True),
-        )
-    except Exception as e:
-        print(f"[MM AUTODETECT SEND] {e}")
-        return
-    _mm_deals[deal_id]["claim_message_id"] = str(claim_msg.id)
     save_mm_deals(_mm_deals)
-    bot.add_view(MMClaimView(deal_id), message_id=claim_msg.id)
+    if not opener:
+        print(f"[MM AUTODETECT] No opener found for #{name} — skipping intake")
+        return
+    await start_mm_intake(channel, deal_id, _mm_deals[deal_id])
 
     print(
         f"[MM AUTODETECT] Started deal {deal_id} "
@@ -5753,6 +5962,13 @@ async def on_message(message):
         str(deal.get("ticket_channel_id")) == str(message.channel.id)
         for deal in _mm_deals.values()
     )
+    if is_mm_channel:
+        try:
+            if await handle_mm_intake_message(message):
+                await bot.process_commands(message)
+                return
+        except Exception as e:
+            print(f"[MM INTAKE] {e}")
     if not message.author.bot and is_negotiation_channel(message.channel, config) and not is_mm_channel:
         _ticket_inactivity[str(message.channel.id)] = {
             "last_activity": time.time(),
