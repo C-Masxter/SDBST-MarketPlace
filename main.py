@@ -4282,24 +4282,23 @@ async def ticket_count_change(interaction: discord.Interaction, member: discord.
         ephemeral=True
     )
 
-@bot.tree.command(name="ps", description="Send private-server transfer instructions.")
-async def private_server(interaction: discord.Interaction):
+@bot.tree.command(name="ps", description="Ping the selected buyer and seller with private-server instructions.")
+@app_commands.describe(buyer="Buyer to ping", seller="Seller to ping")
+async def private_server(interaction: discord.Interaction, buyer: discord.Member, seller: discord.Member):
     deal_id, deal = await mm_command_context(interaction)
     if not deal:
         return
     config = await get_server_config(interaction.guild.id)
     link = str(config.get("roblox_private_server_link") or "https://www.roblox.com/share?code=4467a3deb2306548b3fec0065a4c85f9&type=Server")
-    seller_id = next((str(uid) for uid, role in deal.get("roles", {}).items() if role == "seller"), None)
-    if not seller_id:
-        await safe_error(interaction, "❌ The seller has not been selected in this MM ticket yet.")
-        return
     await interaction.response.send_message(
-        f"<@{seller_id}> Join the private server and transfer your items to the Middleman:\n{link}",
-        allowed_mentions=discord.AllowedMentions(users=True)
+        f"{buyer.mention} {seller.mention}\nJoin the private server and transfer the item to the Middleman:\n{link}",
+        allowed_mentions=discord.AllowedMentions(users=True),
     )
 
-@bot.tree.command(name="vouch", description="Complete an MM ticket and request vouches.")
-async def vouch_ticket(interaction: discord.Interaction):
+
+@bot.tree.command(name="vouch", description="Ping the selected buyer and seller to leave a vouch.")
+@app_commands.describe(buyer="Buyer to ping", seller="Seller to ping")
+async def vouch_ticket(interaction: discord.Interaction, buyer: discord.Member, seller: discord.Member):
     deal_id, deal = await mm_command_context(interaction)
     if not deal:
         return
@@ -4317,49 +4316,29 @@ async def vouch_ticket(interaction: discord.Interaction):
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
             print(f"[VOUCH CHANNEL LOOKUP] id={channel_id}: {e}")
     if not isinstance(vouch_channel, discord.TextChannel):
-        await interaction.followup.send(
-            "❌ The configured vouches channel is missing or invalid. In `/setup` → Vouch Settings, enter the ID of a text channel.",
-            ephemeral=True
-        )
+        await interaction.followup.send("❌ The configured vouches channel is missing or invalid. In `/setup` → Vouch Settings, enter the ID of a text channel.", ephemeral=True)
         return
-    try:
-        buyer_id = next((str(uid) for uid, role in deal.get("roles", {}).items() if role == "buyer"), None)
-        seller_id = next((str(uid) for uid, role in deal.get("roles", {}).items() if role == "seller"), None)
-        participants = [str(uid) for uid in deal.get("participants", [])]
-        buyer_id = buyer_id or (participants[0] if participants else None)
-        seller_id = seller_id or (participants[1] if len(participants) > 1 else None)
-        if not buyer_id or not seller_id:
-            await interaction.followup.send("❌ The buyer and seller have not been identified in this MM ticket yet.", ephemeral=True)
-            return
-        mm_id = str(deal.get("claimed_by") or interaction.user.id)
-        mm = interaction.guild.get_member(int(mm_id))
-        if mm is None and deal.get("claimed_by"):
-            try:
-                mm = await interaction.guild.fetch_member(int(mm_id))
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError):
-                mm = None
-        mm_mention = mm.mention if mm is not None else f"<@{mm_id}>"
-        amount = deal.get("price") or "the deal amount"
-        await interaction.followup.send(
-            f"<@{buyer_id}> <@{seller_id}>\nThis middleman ticket has been completed.\n"
-            f"Please leave a vouch for {mm_mention} in {vouch_channel.mention}.\n\n"
-            f"Sample vouch format: `Vouch mm {mm_mention} {amount} deal fast and easy`",
-            allowed_mentions=discord.AllowedMentions(users=True)
-        )
-        try:
-            timeout = int(config.get("vouch_timeout_seconds") or 86400)
-        except (TypeError, ValueError):
-            timeout = 86400
-        _vouch_state[deal_id] = {"deadline": time.time() + timeout, "participants": [seller_id, buyer_id], "vouched": [], "blacklisted": [], "blacklist_role_id": str(config.get("blacklist_role_id") or "")}
-        deal["state"] = "completed"
-        save_vouch_state()
-        save_mm_deals(_mm_deals)
-    except Exception as e:
-        print(f"[VOUCH COMMAND] deal={deal_id}: {e}")
-        await interaction.followup.send(
-            "❌ The vouch message could not be completed. Check the bot console for `[VOUCH COMMAND]` details.",
-            ephemeral=True
-        )
+    mm_id = str(deal.get("claimed_by") or interaction.user.id)
+    mm_mention = f"<@{mm_id}>"
+    amount = deal.get("price") or "the deal amount"
+    await interaction.followup.send(
+        f"{buyer.mention} {seller.mention}\nThis middleman ticket has been completed.\n"
+        f"Please leave a vouch for {mm_mention} in {vouch_channel.mention}.\n\n"
+        f"Sample vouch format: `Vouch mm {mm_mention} {amount} deal fast and easy`",
+        allowed_mentions=discord.AllowedMentions(users=True),
+    )
+    timeout = int(config.get("vouch_timeout_seconds") or 86400)
+    _vouch_state[deal_id] = {
+        "deadline": time.time() + timeout,
+        "participants": [str(seller.id), str(buyer.id)],
+        "vouched": [],
+        "blacklisted": [],
+        "blacklist_role_id": str(config.get("blacklist_role_id") or ""),
+    }
+    deal["state"] = "completed"
+    save_vouch_state()
+    save_mm_deals(_mm_deals)
+
 
 class MMRoleButton(discord.ui.Button):
     def __init__(self, deal_id, role, label, emoji):
@@ -5150,6 +5129,11 @@ class DealConfirmView(discord.ui.View):
     description="Request a middleman — opens an MM ticket."
 )
 async def mm(interaction: discord.Interaction):
+    """Create a simple MM ticket and invite the configured MM claim roles immediately.
+
+    The old three-step participant/role/deal flow is intentionally disabled for now.
+    The original implementation is preserved in mm_system_recovery_original.py.
+    """
     mm_tier = _pending_mm_tiers.pop(interaction.id, None)
     if interaction.guild is None:
         await safe_error(interaction, "❌ This command must be used inside a server.")
@@ -5157,10 +5141,7 @@ async def mm(interaction: discord.Interaction):
     config = await get_server_config(interaction.guild.id)
     category_id = config.get("mm_ticket_category_id")
     if not category_id:
-        await safe_error(
-            interaction,
-            "❌ MM Ticket Category is not configured. Set it in `/setup` → Channels → MM Ticket Category."
-        )
+        await safe_error(interaction, "❌ MM Ticket Category is not configured. Set it in `/setup` → Channels → MM Ticket Category.")
         return
     try:
         category_id = int(category_id)
@@ -5173,16 +5154,16 @@ async def mm(interaction: discord.Interaction):
         return
     if not interaction.response.is_done():
         await interaction.response.defer(ephemeral=True)
+
     ticket_num = await next_mm_ticket_number(interaction.guild.id)
     channel_name = f"need-middleman-{ticket_num}"
-    _pending_mm_channels.add(
-        (interaction.guild.id, channel_name)
-    )
+    _pending_mm_channels.add((interaction.guild.id, channel_name))
     overwrites = {
         interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
         interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-        interaction.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True)
+        interaction.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True),
     }
+
     tier_roles = []
     tier_key = f"mm_tier_roles_{mm_tier}" if mm_tier else None
     for raw_id in str(config.get(tier_key) or "").split(",") if tier_key else []:
@@ -5190,14 +5171,16 @@ async def mm(interaction: discord.Interaction):
             role = interaction.guild.get_role(int(raw_id.strip()))
             if role:
                 tier_roles.append(role)
+                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True)
         except (TypeError, ValueError):
             continue
+
     try:
         ticket_channel = await interaction.guild.create_text_channel(
             name=channel_name,
             category=category,
             overwrites=overwrites,
-            topic=f"SDBST Middleman Ticket • {interaction.user}"
+            topic=f"SDBST Middleman Ticket • {interaction.user}",
         )
     except (discord.Forbidden, discord.HTTPException) as e:
         print(f"[MM CHANNEL CREATE IN CATEGORY] status={getattr(e, 'status', '?')} code={getattr(e, 'code', '?')} error={e}")
@@ -5205,55 +5188,52 @@ async def mm(interaction: discord.Interaction):
             ticket_channel = await interaction.guild.create_text_channel(
                 name=channel_name,
                 overwrites=overwrites,
-                topic=f"SDBST Middleman Ticket • {interaction.user}"
+                topic=f"SDBST Middleman Ticket • {interaction.user}",
             )
-            print(f"[MM CHANNEL FALLBACK] Created {ticket_channel} outside the configured category.")
         except (discord.Forbidden, discord.HTTPException) as fallback_error:
             print(f"[MM CHANNEL FALLBACK FAILED] status={getattr(fallback_error, 'status', '?')} code={getattr(fallback_error, 'code', '?')} error={fallback_error}")
             await interaction.followup.send(channel_creation_error_message(fallback_error, mm=True), ephemeral=True)
             return
+
     deal_id = uuid.uuid4().hex[:8]
-    claim_msg = None
-    select_embed = discord.Embed(
-        title="SDBST MM System",
-        description="Please select your trade partner in the box below.",
-        color=MM_LIGHT_BLUE
-    )
-    try:
-        select_msg = await ticket_channel.send(embed=select_embed, view=MMSelectUserView(deal_id))
-    except Exception as e:
-        print(f"[MM SELECT MSG] {e}")
-        select_msg = None
+    participant_id = str(interaction.user.id)
+    configured_mentions = " ".join(f"<@&{role.id}>" for role in tier_roles)
+    mm_mentions = configured_mentions or "the configured MM team"
     _mm_deals[deal_id] = {
         "guild_id": str(interaction.guild.id),
         "ticket_channel_id": str(ticket_channel.id),
-        "creator_id": str(interaction.user.id),
-        "participants": [],
+        "creator_id": participant_id,
+        "participants": [participant_id],
         "confirmed": {},
-        "names": {},
+        "names": {participant_id: interaction.user.display_name or interaction.user.name},
         "item": None,
         "price": None,
         "payment_method": None,
         "claimed_by": None,
-        "claim_message_id": str(claim_msg.id) if claim_msg else None,
-        "select_message_id": str(select_msg.id) if select_msg else None,
+        "claim_message_id": None,
+        "select_message_id": None,
         "deal_message_id": None,
-        "state": "awaiting_user",
+        "state": "mm_available",
         "tier": mm_tier,
-        "tier_role_ids": [str(role.id) for role in tier_roles]
+        "tier_role_ids": [str(role.id) for role in tier_roles],
     }
     save_mm_deals(_mm_deals)
-    asyncio.create_task(
-        delayed_mm_ping(
-            ticket_channel,
-            f"{interaction.user.mention} Your MM ticket is ready: {ticket_channel.mention}",
-            users=True,
-        )
+
+    status = (
+        f"{interaction.user.mention}\n\n"
+        f"{mm_mentions}\n"
+        "MM ticket created. An available middleman can claim it now.\n"
+        f"Buyer and seller can be selected later with `/ps` and `/vouch`."
     )
-    if select_msg:
-        await interaction.followup.send(f"🎫 MM ticket created {ticket_channel.mention}", ephemeral=True)
-    else:
-        await interaction.followup.send("⚠️ Ticket created, but the participant selector failed to send.", ephemeral=True)
+    claim_msg = await ticket_channel.send(
+        content=status,
+        view=MMClaimView(deal_id),
+        allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+    )
+    _mm_deals[deal_id]["claim_message_id"] = str(claim_msg.id)
+    save_mm_deals(_mm_deals)
+    bot.add_view(MMClaimView(deal_id), message_id=claim_msg.id)
+    await interaction.followup.send(f"🎫 MM ticket created {ticket_channel.mention}", ephemeral=True)
 
 
 # ============================================================
@@ -5685,55 +5665,55 @@ async def on_guild_channel_create(channel):
     opener = _find_ticket_opener(channel)
 
     deal_id = uuid.uuid4().hex[:8]
+    tier_roles = []
+    for tier_key in ("mm_tier_roles_below_100", "mm_tier_roles_100_200", "mm_tier_roles_200_500", "mm_tier_roles_500_1000", "mm_tier_roles_above_1000"):
+        for raw_id in str(config.get(tier_key) or "").split(","):
+            try:
+                role = channel.guild.get_role(int(raw_id.strip()))
+                if role and role not in tier_roles:
+                    tier_roles.append(role)
+            except (TypeError, ValueError):
+                continue
+    for role in tier_roles:
+        try:
+            await channel.set_permissions(role, view_channel=True, send_messages=False, read_message_history=True)
+        except Exception as e:
+            print(f"[MM AUTODETECT ROLE PERMS] {e}")
 
-    select_embed = discord.Embed(
-        title="SDBST MM System",
-        description="Please select your trade partner in the box below.",
-        color=discord.Color.blue()
-    )
-
-    try:
-
-        select_msg = await channel.send(
-            embed=select_embed,
-            view=MMSelectUserView(deal_id)
-        )
-
-    except Exception as e:
-
-        print(f"[MM AUTODETECT SEND] {e}")
-
-        return
-
+    opener_id = str(opener.id) if opener else None
     _mm_deals[deal_id] = {
         "guild_id": str(channel.guild.id),
         "ticket_channel_id": str(channel.id),
-        "creator_id": (
-            str(opener.id) if opener else None
-        ),
-        "participants": [],
+        "creator_id": opener_id,
+        "participants": [opener_id] if opener_id else [],
         "confirmed": {},
-        "names": {},
+        "names": {opener_id: opener.display_name or opener.name} if opener_id else {},
         "item": None,
         "price": None,
         "payment_method": None,
         "claimed_by": None,
         "claim_message_id": None,
-        "select_message_id": str(select_msg.id),
+        "select_message_id": None,
         "deal_message_id": None,
-        "state": "awaiting_user"
+        "state": "mm_available",
+        "tier_role_ids": [str(role.id) for role in tier_roles],
     }
 
-    save_mm_deals(_mm_deals)
-
-    if opener:
-        asyncio.create_task(
-            delayed_mm_ping(
-                channel,
-                f"<@{opener.id}> Your MM ticket is ready: {channel.mention}",
-                users=True,
-            )
+    team_mentions = " ".join(f"<@&{role.id}>" for role in tier_roles) or "the configured MM team"
+    opener_mention = f"<@{opener.id}>" if opener else ""
+    status = f"{opener_mention}\n\n{team_mentions}\nMM ticket detected. An available middleman can claim it now."
+    try:
+        claim_msg = await channel.send(
+            content=status,
+            view=MMClaimView(deal_id),
+            allowed_mentions=discord.AllowedMentions(users=True, roles=True),
         )
+    except Exception as e:
+        print(f"[MM AUTODETECT SEND] {e}")
+        return
+    _mm_deals[deal_id]["claim_message_id"] = str(claim_msg.id)
+    save_mm_deals(_mm_deals)
+    bot.add_view(MMClaimView(deal_id), message_id=claim_msg.id)
 
     print(
         f"[MM AUTODETECT] Started deal {deal_id} "
