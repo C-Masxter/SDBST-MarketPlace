@@ -66,6 +66,17 @@ COMMAND_GUILD_IDS = (
 # API CLIENT
 # ============================================================
 
+_server_config_cache = {}
+SERVER_CONFIG_CACHE_TTL = 45.0
+
+
+def invalidate_server_config_cache(server_id=None):
+    if server_id is None:
+        _server_config_cache.clear()
+    else:
+        _server_config_cache.pop(str(server_id), None)
+
+
 class MarketplaceAPI:
 
     def __init__(self):
@@ -124,6 +135,8 @@ class MarketplaceAPI:
 
 
     async def save_config(self, server_id, data):
+
+        invalidate_server_config_cache(server_id)
 
         response = await self.client.put(
             f"/api/public/bot/config/{server_id}",
@@ -671,7 +684,14 @@ def ticket_channel_name(buyer, seller):
     )[:100]
 
 
-async def get_server_config(guild_id):
+async def get_server_config(guild_id, use_cache=True):
+
+    cache_key = str(guild_id)
+
+    if use_cache:
+        cached = _server_config_cache.get(cache_key)
+        if cached and (time.monotonic() - cached[0]) < SERVER_CONFIG_CACHE_TTL:
+            return dict(cached[1])
 
     backend = {}
 
@@ -709,7 +729,18 @@ async def get_server_config(guild_id):
         if key not in merged or merged.get(key) in (None, "", [], {}):
             merged[key] = value
 
+    _server_config_cache[cache_key] = (time.monotonic(), dict(merged))
+
     return merged
+
+
+async def safe_list_tickets(guild_id):
+    """Never let a slow/failed ticket listing block ticket creation."""
+    try:
+        return await asyncio.wait_for(api.list_tickets(guild_id), timeout=3.0)
+    except Exception as e:
+        print(f"[TICKET LIST] {e}")
+        return []
 
 
 def configured_channel(guild, channel_id):
@@ -3042,8 +3073,9 @@ class AdButtons(discord.ui.View):
 
             return
 
-        config = await get_server_config(
-            guild.id
+        config, prefetched_tickets = await asyncio.gather(
+            get_server_config(guild.id),
+            safe_list_tickets(guild.id),
         )
 
         category_id = config.get(
@@ -3103,11 +3135,14 @@ class AdButtons(discord.ui.View):
 
             return
 
+        seller = guild.get_member(owner_id)
+
         try:
 
-            seller = await guild.fetch_member(
-                owner_id
-            )
+            if seller is None:
+                seller = await guild.fetch_member(
+                    owner_id
+                )
 
         except discord.NotFound:
 
@@ -3137,9 +3172,7 @@ class AdButtons(discord.ui.View):
 
         try:
 
-            tickets = await api.list_tickets(
-                guild.id
-            )
+            tickets = prefetched_tickets
 
             open_ticket_count = 0
             for ticket in tickets:
@@ -3256,8 +3289,14 @@ class AdButtons(discord.ui.View):
                 return
 
         # ----------------------------------------------------
-        # Save ticket to backend
+        # Tell the buyer immediately, finish the rest in the
+        # background so the click feels instant.
         # ----------------------------------------------------
+
+        await interaction.followup.send(
+            f"🔔 Negotiation channel created: {ticket_channel.mention}",
+            ephemeral=True
+        )
 
         ticket_data = {
 
@@ -3277,89 +3316,79 @@ class AdButtons(discord.ui.View):
                 str(owner_id)
         }
 
-        try:
+        ad = dict(self.ad)
+        buyer = interaction.user
+        mm_link = (
+            f"https://discord.com/channels/{guild.id}/{config.get('mm_channel_id')}"
+            if config.get("mm_channel_id") else None
+        )
 
-            ticket_record = await api.create_ticket(
-                ticket_data
-            )
+        async def finish_ticket_setup():
 
-        except Exception as e:
+            ticket_record = None
 
-            print(
-                f"[TICKET API] {e}"
-            )
+            for attempt in range(2):
+                try:
+                    ticket_record = await api.create_ticket(ticket_data)
+                    break
+                except Exception as e:
+                    print(f"[TICKET API attempt {attempt + 1}] {e}")
+                    await asyncio.sleep(1)
+
+            if not ticket_record:
+
+                try:
+                    await ticket_channel.delete(
+                        reason="Backend ticket creation failed"
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    await buyer.send(
+                        "❌ The ticket couldn't be saved to the backend, "
+                        "so it was removed. Please try again."
+                    )
+                except Exception:
+                    pass
+
+                return
 
             try:
 
-                await ticket_channel.delete(
-                    reason=(
-                        "Backend ticket creation failed"
+                await ticket_channel.send(
+                    content=(
+                        f"{seller.mention} "
+                        f"{buyer.mention}\n\n"
+                        f"🔔 Negotiation channel created: {ticket_channel.mention}\n"
+                        f"💬 You can negotiate the deal privately here in this ticket.\n\n"
+
+                        f"🎫 **Trade ticket opened**\n"
+
+                        f"**Item:** "
+                        f"{ad.get('item')}\n"
+
+                        f"**Price:** "
+                        f"{money(ad.get('price'))}\n"
+
+                        f"**Buyer:** "
+                        f"{buyer.mention}\n"
+
+                        f"**Seller:** "
+                        f"{seller.mention}\n\n"
+
+                    ),
+                    view=TicketButtons(
+                        ticket_record,
+                        mm_link=mm_link
                     )
                 )
 
-            except Exception:
-                pass
+            except Exception as e:
 
-            await safe_error(
-                interaction,
-                (
-                    "❌ The ticket couldn't be "
-                    "saved to the backend. "
-                    "Please try again."
-                )
-            )
+                print(f"[TICKET MESSAGE] {e}")
 
-            return
-
-        # ----------------------------------------------------
-        # Ticket opening message
-        # ----------------------------------------------------
-
-        ticket_message = None
-
-        try:
-
-            ticket_message = await ticket_channel.send(
-                content=(
-                    f"{seller.mention} "
-                    f"{interaction.user.mention}\n\n"
-                    f"🔔 Negotiation channel created: {ticket_channel.mention}\n"
-                    f"💬 You can negotiate the deal privately here in this ticket.\n\n"
-
-                    f"🎫 **Trade ticket opened**\n"
-
-                    f"**Item:** "
-                    f"{self.ad.get('item')}\n"
-
-                    f"**Price:** "
-                    f"{money(self.ad.get('price'))}\n"
-
-                    f"**Buyer:** "
-                    f"{interaction.user.mention}\n"
-
-                    f"**Seller:** "
-                    f"{seller.mention}\n\n"
-
-                ),
-                view=TicketButtons(
-                    ticket_record,
-                    mm_link=(
-                        f"https://discord.com/channels/{guild.id}/{config.get('mm_channel_id')}"
-                        if config.get("mm_channel_id") else None
-                    )
-                )
-            )
-
-        except Exception as e:
-
-            print(
-                f"[TICKET MESSAGE] {e}"
-            )
-
-        await interaction.followup.send(
-            f"🔔 Negotiation channel created: {ticket_channel.mention}",
-            ephemeral=True
-        )
+        asyncio.create_task(finish_ticket_setup())
 
 
     # ========================================================
@@ -4078,6 +4107,29 @@ async def close_mm_deal(interaction, deal_id, deal, source_message=None):
     except Exception as e:
         print(f"[MM CLOSE NOTICE] {e}")
 
+def mm_channel_name_for(member):
+    """Channel-safe version of an MM's display name."""
+    raw = (getattr(member, "display_name", None) or getattr(member, "name", "") or "middleman").lower()
+    cleaned = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
+    return (cleaned or "middleman")[:90]
+
+
+def rename_mm_channel(channel, new_name):
+    """Rename in the background: Discord throttles channel renames hard."""
+
+    async def _do_rename():
+        try:
+            if channel and channel.name != new_name:
+                await channel.edit(name=new_name, reason="MM claim state changed")
+        except Exception as e:
+            print(f"[MM RENAME] {e}")
+
+    try:
+        asyncio.create_task(_do_rename())
+    except RuntimeError as e:
+        print(f"[MM RENAME] {e}")
+
+
 class MMClaimButton(discord.ui.Button):
 
     def __init__(self, deal_id):
@@ -4105,8 +4157,14 @@ class MMClaimButton(discord.ui.Button):
                 await interaction.followup.send("❌ This ticket has already been claimed.", ephemeral=True)
                 return
             deal["claimed_by"] = str(interaction.user.id)
+            if not deal.get("base_channel_name") and interaction.channel:
+                deal["base_channel_name"] = interaction.channel.name
             record_mm_claim(interaction.guild.id, interaction.user.id)
         save_mm_deals(_mm_deals)
+        rename_mm_channel(
+            interaction.channel,
+            mm_channel_name_for(interaction.user)
+        )
         await apply_claimed_mm_chat_permissions(interaction.channel, interaction.guild, deal)
         embed = (
             interaction.message.embeds[0]
@@ -4143,6 +4201,10 @@ class MMUnclaimButton(discord.ui.Button):
             deal["claimed_by"] = None
             deal["state"] = "mm_available"
             save_mm_deals(_mm_deals)
+            rename_mm_channel(
+                interaction.channel,
+                deal.get("base_channel_name") or "need-middleman"
+            )
             for raw_id in deal.get("tier_role_ids", []):
                 try:
                     role = interaction.guild.get_role(int(raw_id))
@@ -5451,6 +5513,7 @@ async def mm(interaction: discord.Interaction):
         "state": "mm_available",
         "tier": mm_tier,
         "tier_role_ids": [str(role.id) for role in tier_roles],
+        "base_channel_name": channel_name,
     }
     save_mm_deals(_mm_deals)
 
