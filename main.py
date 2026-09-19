@@ -472,7 +472,7 @@ async def delayed_mm_ping(channel, content, *, users=False, roles=False, delay=1
         print(f"[MM DELAYED PING] {e}")
 
 
-async def temporary_mm_ping(channel, content, *, delay=3.0):
+async def temporary_mm_ping(channel, content, *, delay=1.5):
     """Ping a participant once, then remove the ping message for a clean ticket."""
     try:
         ping_message = await channel.send(
@@ -582,7 +582,7 @@ async def notify_trade_participant(message):
         await temporary_mm_ping(
             message.channel,
             f"<@{recipient_id}>\nYou’ve received a response on your trade.",
-            delay=3.0
+            delay=1.5
         )
     except Exception as e:
         print(f"[TRADE PARTICIPANT PING] {e}")
@@ -5205,7 +5205,8 @@ async def start_mm_intake(channel, deal_id, deal):
             allowed_mentions=allowed,
         )
         await channel.send(
-            f"{mention} who are you trading with? Send their Discord username, ID, or ping them.",
+            f"{MM_FLOW_DIVIDER}\n{mention} who are you trading with? "
+            "Send their Discord username, ID, or ping them.",
             allowed_mentions=allowed,
         )
     except Exception as e:
@@ -5893,11 +5894,15 @@ async def on_guild_channel_create(channel):
                     tier_roles.append(role)
             except (TypeError, ValueError):
                 continue
-    for role in tier_roles:
+    # Apply role permissions concurrently so the intake prompts
+    # post immediately instead of waiting on one API call per role.
+    async def _grant_role_access(role):
         try:
             await channel.set_permissions(role, view_channel=True, send_messages=False, read_message_history=True)
         except Exception as e:
             print(f"[MM AUTODETECT ROLE PERMS] {e}")
+
+    await asyncio.gather(*(_grant_role_access(role) for role in tier_roles))
 
     opener_id = str(opener.id) if opener else None
     _mm_deals[deal_id] = {
