@@ -473,7 +473,7 @@ def mm_step(step, title, next_step=None):
     return text
 
 
-async def delayed_mm_ping(channel, content, *, users=False, roles=False, delay=1.5):
+async def delayed_mm_ping(channel, content, *, users=False, roles=False, delay=3.0):
     """Send a notification after Discord has had time to create/update access."""
     await asyncio.sleep(delay)
     try:
@@ -485,7 +485,7 @@ async def delayed_mm_ping(channel, content, *, users=False, roles=False, delay=1
         print(f"[MM DELAYED PING] {e}")
 
 
-async def temporary_mm_ping(channel, content, *, delay=1.5):
+async def temporary_mm_ping(channel, content, *, delay=3.0):
     """Ping a participant once, then remove the ping message for a clean ticket."""
     try:
         ping_message = await channel.send(
@@ -595,7 +595,7 @@ async def notify_trade_participant(message):
         await temporary_mm_ping(
             message.channel,
             f"<@{recipient_id}>\nYou’ve received a response on your trade.",
-            delay=1.5
+            delay=3.0
         )
     except Exception as e:
         print(f"[TRADE PARTICIPANT PING] {e}")
@@ -4114,20 +4114,67 @@ def mm_channel_name_for(member):
     return (cleaned or "middleman")[:90]
 
 
+_rename_tasks = {}
+
+
 def rename_mm_channel(channel, new_name):
-    """Rename in the background: Discord throttles channel renames hard."""
+    """Rename in the background with retries: Discord throttles channel renames hard."""
+    if not channel or not new_name:
+        return
+
+    target = re.sub(r"[^a-z0-9-]+", "-", str(new_name).lower()).strip("-")[:90] or "ticket"
 
     async def _do_rename():
-        try:
-            if channel and channel.name != new_name:
-                await channel.edit(name=new_name, reason="MM claim state changed")
-        except Exception as e:
-            print(f"[MM RENAME] {e}")
+        for attempt in range(5):
+            try:
+                fresh = bot.get_channel(channel.id) or channel
+                if fresh.name == target:
+                    return
+                await fresh.edit(name=target, reason="MM claim state changed")
+                print(f"[MM RENAME] #{fresh.id} -> {target}")
+                return
+            except discord.Forbidden as e:
+                print(f"[MM RENAME] missing Manage Channels permission: {e}")
+                return
+            except discord.HTTPException as e:
+                wait = getattr(e, "retry_after", None) or (5 * (attempt + 1))
+                print(f"[MM RENAME] attempt {attempt + 1} failed ({e}); retrying in {wait}s")
+                await asyncio.sleep(wait)
+            except Exception as e:
+                print(f"[MM RENAME] {e}")
+                return
+        print(f"[MM RENAME] gave up renaming channel {channel.id} to {target}")
 
+    previous = _rename_tasks.get(channel.id)
+    if previous and not previous.done():
+        previous.cancel()
     try:
-        asyncio.create_task(_do_rename())
+        _rename_tasks[channel.id] = asyncio.create_task(_do_rename())
     except RuntimeError as e:
         print(f"[MM RENAME] {e}")
+
+
+def mm_deal_party(guild, deal, wanted_role):
+    """Return the member stored on the deal for 'buyer' or 'seller'."""
+    roles = deal.get("roles", {}) or {}
+    user_id = next((uid for uid, role in roles.items() if role == wanted_role), None)
+    if not user_id:
+        participants = [str(x) for x in deal.get("participants", [])]
+        index = 0 if wanted_role == "buyer" else 1
+        user_id = participants[index] if len(participants) > index else None
+    if not user_id:
+        return None
+    try:
+        return guild.get_member(int(user_id)) or discord.Object(id=int(user_id))
+    except (TypeError, ValueError):
+        return None
+
+
+def mm_party_mention(guild, deal, wanted_role):
+    party = mm_deal_party(guild, deal, wanted_role)
+    if party is None:
+        return None, None
+    return f"<@{party.id}>", str(party.id)
 
 
 class MMClaimButton(discord.ui.Button):
@@ -4344,27 +4391,34 @@ async def ticket_count_change(interaction: discord.Interaction, member: discord.
         ephemeral=True
     )
 
-@bot.tree.command(name="ps", description="Ping the selected buyer and seller with private-server instructions.")
-@app_commands.describe(buyer="Buyer to ping", seller="Seller to ping")
-async def private_server(interaction: discord.Interaction, buyer: discord.Member, seller: discord.Member):
+@bot.tree.command(name="ps", description="Ping the seller with private-server instructions.")
+async def private_server(interaction: discord.Interaction):
     deal_id, deal = await mm_command_context(interaction)
     if not deal:
         return
     config = await get_server_config(interaction.guild.id)
     link = str(config.get("roblox_private_server_link") or "https://www.roblox.com/share?code=4467a3deb2306548b3fec0065a4c85f9&type=Server")
+    seller_mention, _ = mm_party_mention(interaction.guild, deal, "seller")
+    if not seller_mention:
+        await safe_error(interaction, "❌ No seller is set on this ticket yet.")
+        return
     await interaction.response.send_message(
-        f"{buyer.mention} {seller.mention}\nJoin the private server and transfer the item to the Middleman:\n{link}",
+        f"{seller_mention}\nJoin the private server and transfer the item to the Middleman:\n{link}",
         allowed_mentions=discord.AllowedMentions(users=True),
     )
 
 
-@bot.tree.command(name="vouch", description="Ping the selected buyer and seller to leave a vouch.")
-@app_commands.describe(buyer="Buyer to ping", seller="Seller to ping")
-async def vouch_ticket(interaction: discord.Interaction, buyer: discord.Member, seller: discord.Member):
+@bot.tree.command(name="vouch", description="Ping the ticket's buyer and seller to leave a vouch.")
+async def vouch_ticket(interaction: discord.Interaction):
     deal_id, deal = await mm_command_context(interaction)
     if not deal:
         return
     await interaction.response.defer()
+    buyer_mention, buyer_id = mm_party_mention(interaction.guild, deal, "buyer")
+    seller_mention, seller_id = mm_party_mention(interaction.guild, deal, "seller")
+    if not buyer_mention or not seller_mention:
+        await interaction.followup.send("❌ This ticket doesn't have both a buyer and a seller set yet.", ephemeral=True)
+        return
     config = await get_server_config(interaction.guild.id)
     vouch_channel_id = config.get("vouches_channel_id")
     try:
@@ -4384,7 +4438,7 @@ async def vouch_ticket(interaction: discord.Interaction, buyer: discord.Member, 
     mm_mention = f"<@{mm_id}>"
     amount = deal.get("price") or "the deal amount"
     await interaction.followup.send(
-        f"{buyer.mention} {seller.mention}\nThis middleman ticket has been completed.\n"
+        f"{buyer_mention} {seller_mention}\nThis middleman ticket has been completed.\n"
         f"Please leave a vouch for {mm_mention} in {vouch_channel.mention}.\n\n"
         f"Sample vouch format: `Vouch mm {mm_mention} {amount} deal fast and easy`",
         allowed_mentions=discord.AllowedMentions(users=True),
@@ -4392,7 +4446,7 @@ async def vouch_ticket(interaction: discord.Interaction, buyer: discord.Member, 
     timeout = int(config.get("vouch_timeout_seconds") or 86400)
     _vouch_state[deal_id] = {
         "deadline": time.time() + timeout,
-        "participants": [str(seller.id), str(buyer.id)],
+        "participants": [seller_id, buyer_id],
         "vouched": [],
         "blacklisted": [],
         "blacklist_role_id": str(config.get("blacklist_role_id") or ""),
@@ -5435,7 +5489,15 @@ async def mm(interaction: discord.Interaction):
     if interaction.guild is None:
         await safe_error(interaction, "❌ This command must be used inside a server.")
         return
-    config = await get_server_config(interaction.guild.id)
+    # Use the settings already loaded by the bot so a slow backend request
+    # cannot hold up the visible Discord channel creation.
+    guild_key = str(interaction.guild.id)
+    config = dict(_bot_config.get(guild_key, {}))
+    cached_config = _server_config_cache.get(guild_key)
+    if cached_config:
+        config.update(cached_config[1])
+    if not config.get("mm_ticket_category_id"):
+        config = await get_server_config(interaction.guild.id)
     category_id = config.get("mm_ticket_category_id")
     if not category_id:
         await safe_error(interaction, "❌ MM Ticket Category is not configured. Set it in `/setup` → Channels → MM Ticket Category.")
