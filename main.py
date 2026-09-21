@@ -601,34 +601,74 @@ async def notify_trade_participant(message):
         print(f"[TRADE PARTICIPANT PING] {e}")
 
 
-async def log_negotiation_event(message, config, event="MESSAGE"):
-    if message.guild is None or not is_negotiation_channel(message.channel, config):
-        return
-    log_channel_id = (config or {}).get("negotiation_log_channel_id")
+async def create_negotiation_transcript(channel, guild, ticket=None, closed_by=None):
+    """Create and post a full plain-text negotiation transcript to the configured log channel."""
+    config = await get_server_config(guild.id)
+    log_channel_id = config.get("negotiation_log_channel_id")
     try:
-        log_channel = message.guild.get_channel(int(log_channel_id)) if log_channel_id else None
+        log_channel = guild.get_channel(int(log_channel_id)) if log_channel_id else None
     except (TypeError, ValueError):
         log_channel = None
-    if not isinstance(log_channel, discord.TextChannel) or log_channel.id == message.channel.id:
-        return
-    content = (getattr(message, "content", "") or "").strip() or "[no text]"
-    attachments = ""
-    if getattr(message, "attachments", None):
-        attachments = "\nAttachments: " + ", ".join(a.url for a in message.attachments)
-    embed = discord.Embed(
-        title=f"Negotiation {event}",
-        description=(
-            f"**Channel:** {message.channel.mention}\n"
-            f"**Author:** {message.author.mention}\n"
-            f"**Message ID:** `{message.id}`\n\n"
-            f"{content}{attachments}"
-        ),
-        color=discord.Color.blurple()
-    )
+    if not isinstance(log_channel, discord.TextChannel) or log_channel.id == channel.id:
+        return None
+
+    buyer_id = (ticket or {}).get("buyer_id")
+    seller_id = (ticket or {}).get("seller_id")
+    item = (ticket or {}).get("item") or "Not specified"
+    price = (ticket or {}).get("price") or "Not specified"
+    ticket_id = (ticket or {}).get("ticket_id") or "Unknown"
+
+    buyer_str = f"<@{buyer_id}>" if buyer_id else "Unknown"
+    seller_str = f"<@{seller_id}>" if seller_id else "Unknown"
+    closer_str = f"<@{closed_by.id}>" if closed_by else "System"
+
+    lines = [
+        f"Negotiation Ticket: #{channel.name} ({channel.id})",
+        f"Ticket ID: {ticket_id}",
+        f"Buyer: {buyer_str}",
+        f"Seller: {seller_str}",
+        f"Item: {item}",
+        f"Price: {price}",
+        f"Closed By: {closer_str}",
+        f"Created: {getattr(channel, "created_at", "Unknown")}",
+        "",
+        "Messages:",
+    ]
     try:
-        await log_channel.send(embed=embed)
+        messages = [msg async for msg in channel.history(limit=None, oldest_first=True)]
     except Exception as e:
-        print(f"[NEGOTIATION LOG] {e}")
+        print(f"[NEGOTIATION TRANSCRIPT HISTORY] {e}")
+        messages = []
+    for msg in messages:
+        ts = msg.created_at.isoformat() if getattr(msg, "created_at", None) else "Unknown time"
+        content = (msg.content or "").replace("\r", "").strip() or "[no text]"
+        lines.append(f"[{ts}] {msg.author} ({msg.author.id}): {content}")
+        for att in getattr(msg, "attachments", []):
+            lines.append(f"  Attachment: {att.url}")
+
+    transcript = "\n".join(lines) + "\n"
+    filename = f"negotiation-{channel.id}-transcript.txt"
+    try:
+        sent = await log_channel.send(
+            content=(
+                f"📝 **Negotiation Ticket Transcript**\n"
+                f"**Channel:** `#{channel.name}`\n"
+                f"**Buyer:** {buyer_str} | **Seller:** {seller_str}\n"
+                f"**Item:** {item} | **Price:** {price}\n"
+                f"**Closed By:** {closer_str}"
+            ),
+            file=discord.File(io.BytesIO(transcript.encode("utf-8")), filename=filename)
+        )
+        return sent.attachments[0].url if sent.attachments else None
+    except Exception as e:
+        print(f"[NEGOTIATION TRANSCRIPT LOG] {e}")
+        return None
+
+
+async def log_negotiation_event(message, config, event="MESSAGE"):
+    # Replaced individual message logging with full channel transcripts on close,
+    # as per channel transcript preferences.
+    pass
 
 
 
@@ -3619,7 +3659,11 @@ class TicketButtons(discord.ui.View):
 
             return
 
-        await interaction.response.send_message("🔒 Deleting negotiation ticket...", ephemeral=True)
+        await interaction.response.send_message("🔒 Saving transcript and closing ticket...", ephemeral=True)
+        try:
+            await create_negotiation_transcript(interaction.channel, interaction.guild, self.ticket, interaction.user)
+        except Exception as e:
+            print(f"[CLOSE TICKET TRANSCRIPT] {e}")
         try:
             await api.close_ticket(self.ticket["ticket_id"])
         except Exception as e:
@@ -4204,10 +4248,17 @@ class MMClaimButton(discord.ui.Button):
                 await interaction.followup.send("❌ This ticket has already been claimed.", ephemeral=True)
                 return
             deal["claimed_by"] = str(interaction.user.id)
-            if not deal.get("base_channel_name") and interaction.channel:
-                deal["base_channel_name"] = interaction.channel.name
+            deal["state"] = "claimed"
+            # Ensure base_channel_name preserves the ticket number (e.g. need-middleman-8124)
+            current_base = deal.get("base_channel_name")
+            if not current_base or not current_base.startswith("need-middleman"):
+                ch_name = interaction.channel.name if interaction.channel else ""
+                digits_match = re.search(r"(\d+)", ch_name)
+                num = digits_match.group(1) if digits_match else (self.deal_id[:4] if self.deal_id else "")
+                deal["base_channel_name"] = f"need-middleman-{num}" if num else "need-middleman"
             record_mm_claim(interaction.guild.id, interaction.user.id)
         save_mm_deals(_mm_deals)
+        # Rename channel to the current claiming MM
         rename_mm_channel(
             interaction.channel,
             mm_channel_name_for(interaction.user)
@@ -4218,10 +4269,11 @@ class MMClaimButton(discord.ui.Button):
             if interaction.message.embeds
             else discord.Embed(title="Ticket Created")
         )
-        embed.description = (
-            (embed.description or "")
-            + f"\n\n🤝 **Claimed by {interaction.user.mention}**"
-        )
+        # Clean any previous claim status lines to ensure smooth, clean transitions without duplicates
+        raw_desc = embed.description or ""
+        clean_desc = re.sub(r"(?:\n+)?(?:🤝\s*)?\*\*Claimed by [^\*]+\*\*", "", raw_desc, flags=re.IGNORECASE).strip()
+        clean_desc = re.sub(r"(?:\n+)?(?:🤝\s*)?Claimed by <@[^>]+>", "", clean_desc, flags=re.IGNORECASE).strip()
+        embed.description = f"{clean_desc}\n\n🤝 **Claimed by {interaction.user.mention}**" if clean_desc else f"🤝 **Claimed by {interaction.user.mention}**"
         try:
             await interaction.message.edit(embed=embed, view=MMClaimView(self.deal_id))
         except Exception as e:
@@ -4248,9 +4300,17 @@ class MMUnclaimButton(discord.ui.Button):
             deal["claimed_by"] = None
             deal["state"] = "mm_available"
             save_mm_deals(_mm_deals)
+            # Revert channel name back to base name (need-middleman-xxxx)
+            base_name = deal.get("base_channel_name")
+            if not base_name or not base_name.startswith("need-middleman"):
+                digits_match = re.search(r"(\d+)", interaction.channel.name if interaction.channel else "")
+                num = digits_match.group(1) if digits_match else (self.deal_id[:4] if self.deal_id else "")
+                base_name = f"need-middleman-{num}" if num else "need-middleman"
+                deal["base_channel_name"] = base_name
+                save_mm_deals(_mm_deals)
             rename_mm_channel(
                 interaction.channel,
-                deal.get("base_channel_name") or "need-middleman"
+                base_name
             )
             for raw_id in deal.get("tier_role_ids", []):
                 try:
@@ -4259,7 +4319,22 @@ class MMUnclaimButton(discord.ui.Button):
                         await interaction.channel.set_permissions(role, view_channel=True, send_messages=True, read_message_history=True)
                 except (TypeError, ValueError, discord.HTTPException):
                     pass
-            await interaction.message.edit(view=MMClaimView(self.deal_id))
+            # Update embed to remove the claim line smoothly
+            embed = interaction.message.embeds[0] if interaction.message.embeds else None
+            if embed:
+                raw_desc = embed.description or ""
+                clean_desc = re.sub(r"(?:\n+)?(?:🤝\s*)?\*\*Claimed by [^\*]+\*\*", "", raw_desc, flags=re.IGNORECASE).strip()
+                clean_desc = re.sub(r"(?:\n+)?(?:🤝\s*)?Claimed by <@[^>]+>", "", clean_desc, flags=re.IGNORECASE).strip()
+                embed.description = clean_desc
+                try:
+                    await interaction.message.edit(embed=embed, view=MMClaimView(self.deal_id))
+                except Exception as e:
+                    print(f"[MM UNCLAIM EDIT] {e}")
+            else:
+                try:
+                    await interaction.message.edit(view=MMClaimView(self.deal_id))
+                except Exception as e:
+                    print(f"[MM UNCLAIM VIEW EDIT] {e}")
         await interaction.channel.send(f"↩️ {interaction.user.mention} unclaimed this ticket. Eligible MMs can claim it again.")
 
 class MMClaimView(discord.ui.View):
@@ -6250,6 +6325,10 @@ class InactivityView(discord.ui.View):
             await interaction.response.edit_message(content="🔒 Closing inactive ticket...", view=None)
         except Exception:
             pass
+        try:
+            await create_negotiation_transcript(channel, interaction.guild, closed_by=interaction.user)
+        except Exception as e:
+            print(f"[INACTIVITY TRANSCRIPT] {e}")
         try:
             await channel.delete(reason="Closed after inactivity decision")
         except Exception as e:
