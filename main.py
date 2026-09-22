@@ -601,6 +601,58 @@ async def notify_trade_participant(message):
         print(f"[TRADE PARTICIPANT PING] {e}")
 
 
+def parse_topic_item_price(topic):
+    """Pull item/price out of a 'SDBST Trade • item • price' channel topic."""
+    if not topic:
+        return None, None
+    parts = [p.strip() for p in str(topic).split("•")]
+    if len(parts) >= 3 and parts[0].lower().startswith("sdbst trade"):
+        return (parts[1] or None), (parts[2] or None)
+    return None, None
+
+
+def extract_price_from_text(text):
+    """Find something like $105 / 105$ / 105 usd inside free text."""
+    if not text:
+        return None
+    match = re.search(r"\$\s?(\d[\d,]*(?:\.\d+)?)", str(text))
+    if not match:
+        match = re.search(r"(\d[\d,]*(?:\.\d+)?)\s?(?:\$|usd|dollars?)\b", str(text), flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return money(float(match.group(1).replace(",", "")))
+    except (TypeError, ValueError):
+        return f"${match.group(1)}"
+
+
+async def resolve_ticket_item_price(channel, ticket):
+    """Item/price for a negotiation ticket: record -> channel topic -> ad lookup."""
+    ticket = ticket or {}
+    item = ticket.get("item")
+    price = ticket.get("price")
+    if item and price:
+        return item, money(price) if not str(price).startswith("$") else price
+    topic_item, topic_price = parse_topic_item_price(getattr(channel, "topic", None))
+    item = item or topic_item
+    price = price or topic_price
+    if (not item or not price) and ticket.get("ad_id"):
+        try:
+            ad = await asyncio.wait_for(api.get_ad(ticket["ad_id"]), timeout=3.0)
+        except Exception as e:
+            print(f"[TRANSCRIPT AD LOOKUP] {e}")
+            ad = None
+        if ad:
+            item = item or ad.get("item")
+            price = price or (money(ad.get("price")) if ad.get("price") not in (None, "") else None)
+    if price and not str(price).startswith("$"):
+        try:
+            price = money(price)
+        except Exception:
+            pass
+    return (item or "Not specified"), (price or "Not specified")
+
+
 async def create_negotiation_transcript(channel, guild, ticket=None, closed_by=None):
     """Create and post a full plain-text negotiation transcript to the configured log channel."""
     config = await get_server_config(guild.id)
@@ -614,8 +666,7 @@ async def create_negotiation_transcript(channel, guild, ticket=None, closed_by=N
 
     buyer_id = (ticket or {}).get("buyer_id")
     seller_id = (ticket or {}).get("seller_id")
-    item = (ticket or {}).get("item") or "Not specified"
-    price = (ticket or {}).get("price") or "Not specified"
+    item, price = await resolve_ticket_item_price(channel, ticket)
     ticket_id = (ticket or {}).get("ticket_id") or "Unknown"
 
     buyer_str = f"<@{buyer_id}>" if buyer_id else "Unknown"
@@ -3353,7 +3404,13 @@ class AdButtons(discord.ui.View):
                 str(interaction.user.id),
 
             "seller_id":
-                str(owner_id)
+                str(owner_id),
+
+            "item":
+                str(self.ad.get("item") or ""),
+
+            "price":
+                str(self.ad.get("price") or "")
         }
 
         ad = dict(self.ad)
@@ -3370,6 +3427,12 @@ class AdButtons(discord.ui.View):
             for attempt in range(2):
                 try:
                     ticket_record = await api.create_ticket(ticket_data)
+                    # Keep item/price on the in-memory record even if the
+                    # backend drops unknown fields.
+                    ticket_record = dict(ticket_record or {})
+                    ticket_record.setdefault("item", ad.get("item"))
+                    ticket_record.setdefault("price", ad.get("price"))
+                    ticket_record.setdefault("ad_id", ticket_data.get("ad_id"))
                     break
                 except Exception as e:
                     print(f"[TICKET API attempt {attempt + 1}] {e}")
@@ -4036,7 +4099,7 @@ async def apply_claimed_mm_chat_permissions(channel, guild, deal):
 
 
 async def create_mm_transcript(interaction, deal):
-    """Create and post a plain-text MM transcript to the configured log channel."""
+    """Create and post a plain-text MM transcript (same style as negotiation transcripts)."""
     config = await get_server_config(interaction.guild.id)
     log_channel_id = config.get("negotiation_log_channel_id")
     try:
@@ -4046,30 +4109,42 @@ async def create_mm_transcript(interaction, deal):
     if not isinstance(log_channel, discord.TextChannel):
         return None
 
+    channel = interaction.channel
     participants = [str(uid) for uid in deal.get("participants", [])]
-    buyer_id = next((uid for uid, role in deal.get("roles", {}).items() if role == "buyer"), None)
-    seller_id = next((uid for uid, role in deal.get("roles", {}).items() if role == "seller"), None)
-    buyer = f"<@{buyer_id}>" if buyer_id else (f"<@{participants[0]}>" if participants else "Unknown")
-    seller = f"<@{seller_id}>" if seller_id else (f"<@{participants[1]}>" if len(participants) > 1 else "Unknown")
+    buyer_id = deal.get("buyer_id") or next((uid for uid, role in (deal.get("roles") or {}).items() if role == "buyer"), None)
+    seller_id = deal.get("seller_id") or next((uid for uid, role in (deal.get("roles") or {}).items() if role == "seller"), None)
+    buyer_str = f"<@{buyer_id}>" if buyer_id else (f"<@{participants[0]}>" if participants else "Unknown")
+    seller_str = f"<@{seller_id}>" if seller_id else (f"<@{participants[1]}>" if len(participants) > 1 else "Unknown")
     mm_id = deal.get("claimed_by")
-    mm = f"<@{mm_id}>" if mm_id else "Unclaimed"
-    deal_text = deal.get("price") or deal.get("item") or "Not specified"
-    if deal.get("item") and deal.get("price"):
-        deal_text = f"{deal['item']} | {deal['price']}"
+    mm_str = f"<@{mm_id}>" if mm_id else "Unclaimed"
+    closer_str = f"<@{interaction.user.id}>" if getattr(interaction, "user", None) else "System"
+
+    deal_text = deal.get("deal_text") or ""
+    item = deal.get("item") or deal_text or None
+    price = deal.get("price") or extract_price_from_text(deal_text) or extract_price_from_text(item)
+    if price and not str(price).startswith("$"):
+        try:
+            price = money(price)
+        except Exception:
+            pass
+    item = item or "Not specified"
+    price = price or "Not specified"
 
     lines = [
-        f"Buyer: {buyer}",
-        f"Seller: {seller}",
-        f"MM: {mm}",
-        f"Deal: {deal_text}",
-        "",
-        f"Channel: #{interaction.channel.name} ({interaction.channel.id})",
-        f"Created: {getattr(interaction.channel, 'created_at', 'Unknown')}",
+        f"MM Ticket: #{channel.name} ({channel.id})",
+        f"Deal ID: {deal.get('deal_id') or 'Unknown'}",
+        f"Buyer: {buyer_str}",
+        f"Seller: {seller_str}",
+        f"Middleman: {mm_str}",
+        f"Item: {item}",
+        f"Price: {price}",
+        f"Closed By: {closer_str}",
+        f"Created: {getattr(channel, 'created_at', 'Unknown')}",
         "",
         "Messages:",
     ]
     try:
-        messages = [message async for message in interaction.channel.history(limit=None, oldest_first=True)]
+        messages = [message async for message in channel.history(limit=None, oldest_first=True)]
     except Exception as e:
         print(f"[MM TRANSCRIPT HISTORY] {e}")
         messages = []
@@ -4080,17 +4155,20 @@ async def create_mm_transcript(interaction, deal):
         for attachment in getattr(message, "attachments", []):
             lines.append(f"  Attachment: {attachment.url}")
     transcript = "\n".join(lines) + "\n"
-    filename = f"mm-{interaction.channel.id}-transcript.txt"
+    filename = f"mm-{channel.id}-transcript.txt"
     try:
         sent = await log_channel.send(
             content=(
-                f"Buyer: {buyer}\nSeller: {seller}\nMM: {mm}\nDeal: {deal_text}\n"
-                f"Transcript link: {filename}"
+                f"📝 **MM Ticket Transcript**\n"
+                f"**Channel:** `#{channel.name}`\n"
+                f"**Buyer:** {buyer_str} | **Seller:** {seller_str}\n"
+                f"**Item:** {item} | **Price:** {price}\n"
+                f"**Middleman:** {mm_str}\n"
+                f"**Closed By:** {closer_str}"
             ),
             file=discord.File(io.BytesIO(transcript.encode("utf-8")), filename=filename)
         )
-        attachment_url = sent.attachments[0].url if sent.attachments else None
-        return attachment_url
+        return sent.attachments[0].url if sent.attachments else None
     except Exception as e:
         print(f"[MM TRANSCRIPT LOG] {e}")
         return None
@@ -4159,31 +4237,59 @@ def mm_channel_name_for(member):
 
 
 _rename_tasks = {}
+_rename_history = {}
+RENAME_WINDOW = 600.0   # Discord: max 2 channel renames per 10 minutes
+RENAME_LIMIT = 2
 
 
-def rename_mm_channel(channel, new_name):
-    """Rename in the background with retries: Discord throttles channel renames hard."""
+def _rename_budget(channel_id):
+    """Return (renames left in window, seconds until a slot frees up)."""
+    now = time.time()
+    history = [t for t in _rename_history.get(channel_id, []) if now - t < RENAME_WINDOW]
+    _rename_history[channel_id] = history
+    left = RENAME_LIMIT - len(history)
+    wait = 0.0 if left > 0 else max(0.0, RENAME_WINDOW - (now - history[0]))
+    return left, wait
+
+
+def rename_mm_channel(channel, new_name, notify=True):
+    """Rename in the background. Discord hard-limits renames to 2 per 10 minutes
+    per channel, so when the budget is spent we wait for a free slot (and tell the
+    ticket why) instead of silently doing nothing. The newest requested name wins."""
     if not channel or not new_name:
         return
 
     target = re.sub(r"[^a-z0-9-]+", "-", str(new_name).lower()).strip("-")[:90] or "ticket"
 
     async def _do_rename():
-        for attempt in range(5):
+        for attempt in range(6):
+            fresh = bot.get_channel(channel.id) or channel
+            if fresh.name == target:
+                return
+            left, wait = _rename_budget(channel.id)
+            if left <= 0 and wait > 0:
+                if notify and attempt == 0:
+                    try:
+                        await fresh.send(
+                            f"⏳ Channel name will change to `#{target}` in about "
+                            f"{max(1, int(wait // 60) + 1)} min (Discord only allows 2 renames per 10 minutes)."
+                        )
+                    except Exception:
+                        pass
+                await asyncio.sleep(wait + 1)
+                continue
             try:
-                fresh = bot.get_channel(channel.id) or channel
-                if fresh.name == target:
-                    return
                 await fresh.edit(name=target, reason="MM claim state changed")
+                _rename_history.setdefault(channel.id, []).append(time.time())
                 print(f"[MM RENAME] #{fresh.id} -> {target}")
                 return
             except discord.Forbidden as e:
                 print(f"[MM RENAME] missing Manage Channels permission: {e}")
                 return
             except discord.HTTPException as e:
-                wait = getattr(e, "retry_after", None) or (5 * (attempt + 1))
-                print(f"[MM RENAME] attempt {attempt + 1} failed ({e}); retrying in {wait}s")
-                await asyncio.sleep(wait)
+                retry = getattr(e, "retry_after", None) or (5 * (attempt + 1))
+                print(f"[MM RENAME] attempt {attempt + 1} failed ({e}); retrying in {retry}s")
+                await asyncio.sleep(retry)
             except Exception as e:
                 print(f"[MM RENAME] {e}")
                 return
@@ -4385,8 +4491,16 @@ async def rename_ticket(interaction: discord.Interaction, name: str):
         await safe_error(interaction, "❌ Choose a valid channel name.")
         return
     await interaction.response.defer(ephemeral=True)
-    await interaction.channel.edit(name=cleaned)
-    await interaction.followup.send(f"✅ Ticket renamed to `#{cleaned}`.", ephemeral=True)
+    left, wait = _rename_budget(interaction.channel.id)
+    rename_mm_channel(interaction.channel, cleaned, notify=False)
+    if left > 0:
+        await interaction.followup.send(f"✅ Ticket renamed to `#{cleaned}`.", ephemeral=True)
+    else:
+        await interaction.followup.send(
+            f"⏳ Rename to `#{cleaned}` queued — Discord only allows 2 renames per 10 minutes, "
+            f"it will apply in about {max(1, int(wait // 60) + 1)} min.",
+            ephemeral=True,
+        )
 
 @bot.tree.command(name="close", description="Close the current MM ticket while keeping it visible to staff.")
 async def close_mm_ticket(interaction: discord.Interaction):
@@ -5390,12 +5504,12 @@ async def start_mm_intake(channel, deal_id, deal):
     creator_id = deal.get("creator_id")
     mention = f"<@{creator_id}>" if creator_id else ""
     allowed = discord.AllowedMentions(users=True, roles=False, everyone=False)
+    # Give Discord clients a moment to subscribe to the brand-new channel,
+    # and send the intro + first question as ONE message so nothing gets lost.
+    await asyncio.sleep(1.0)
     try:
         await channel.send(
-            f"{mention} we need some basic info before a middleman can claim your ticket.",
-            allowed_mentions=allowed,
-        )
-        await channel.send(
+            f"{mention} we need some basic info before a middleman can claim your ticket.\n"
             f"{MM_FLOW_DIVIDER}\n{mention} who are you trading with? "
             "Send their Discord username, ID, or ping them.",
             allowed_mentions=allowed,
@@ -5417,6 +5531,7 @@ async def finish_mm_intake(channel, deal_id, deal):
     deal["seller_id"] = seller_id
     deal["roles"] = {buyer_id: "buyer", seller_id: "seller"}
     deal["item"] = deal_text
+    deal["price"] = deal.get("price") or extract_price_from_text(deal_text)
     deal["participants"] = [creator_id, partner_id]
     deal["state"] = "mm_available"
     deal["intake"] = {"step": "done"}
@@ -6549,9 +6664,13 @@ async def create_trade_ticket(guild, buyer, seller, item, price, ad_id):
         "server_id": str(guild.id), "ad_id": str(ad_id),
         "channel_id": str(ticket_channel.id),
         "buyer_id": str(buyer.id), "seller_id": str(seller.id),
+        "item": str(item or ""), "price": str(price or ""),
     }
     try:
-        ticket_record = await api.create_ticket(ticket_data)
+        ticket_record = dict(await api.create_ticket(ticket_data) or {})
+        ticket_record.setdefault("item", item)
+        ticket_record.setdefault("price", price)
+        ticket_record.setdefault("ad_id", str(ad_id))
     except Exception as e:
         print(f"[TICKET API] {e}")
         try:
