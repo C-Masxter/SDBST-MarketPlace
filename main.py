@@ -16,9 +16,6 @@ import uuid
 from pathlib import Path
 
 
-# ============================================================
-# ENVIRONMENT
-# ============================================================
 
 load_dotenv()
 
@@ -44,9 +41,6 @@ if not MARKETPLACE_API_KEY:
 MARKETPLACE_API_URL = MARKETPLACE_API_URL.rstrip("/")
 
 
-# ============================================================
-# TEST SERVER
-# ============================================================
 
 TEST_GUILD_ID = 1543964932200996914
 
@@ -62,9 +56,6 @@ COMMAND_GUILD_IDS = (
 )
 
 
-# ============================================================
-# API CLIENT
-# ============================================================
 
 _server_config_cache = {}
 SERVER_CONFIG_CACHE_TTL = 45.0
@@ -351,9 +342,6 @@ class MarketplaceAPI:
 api = MarketplaceAPI()
 
 
-# ============================================================
-# MM DEALS (local JSON persistence)
-# ============================================================
 
 MM_DEALS_FILE = Path("mm_deals.json")
 
