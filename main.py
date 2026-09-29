@@ -3741,257 +3741,167 @@ class TicketButtons(discord.ui.View):
 
 
 # ============================================================
-# WTB / WTS MODAL
+# WTB / WTS AD LOGIC & COMMANDS
 # ============================================================
+
+async def post_ad(
+    interaction: discord.Interaction,
+    ad_type: str,
+    item: str,
+    offer: str,
+    photo: discord.Attachment = None,
+    image_url: str = None
+):
+    offer_val = (offer or "").strip()
+    if not offer_val:
+        if interaction.response.is_done():
+            await interaction.followup.send("❌ Offer cannot be empty.", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ Offer cannot be empty.", ephemeral=True)
+        return
+
+    item_val = (item or "").strip()
+    if not item_val:
+        if interaction.response.is_done():
+            await interaction.followup.send("❌ Item cannot be empty.", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ Item cannot be empty.", ephemeral=True)
+        return
+
+    price = offer_val
+
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
+
+    if interaction.guild is None:
+        await interaction.followup.send(
+            "❌ This command must be used inside a server.",
+            ephemeral=True
+        )
+        return
+
+    config = await get_server_config(interaction.guild.id)
+
+    if ad_type == "WTB":
+        channel_id = config.get("buying_channel_id")
+    else:
+        channel_id = config.get("selling_channel_id")
+
+    if not channel_id:
+        await interaction.followup.send(
+            (
+                "❌ This marketplace channel isn't configured.\n"
+                "Ask an administrator to run `/setup`."
+            ),
+            ephemeral=True
+        )
+        return
+
+    try:
+        channel = interaction.guild.get_channel(int(channel_id))
+    except (TypeError, ValueError):
+        channel = None
+
+    if not channel:
+        await interaction.followup.send(
+            "❌ The configured marketplace channel couldn't be found.",
+            ephemeral=True
+        )
+        return
+
+    await delete_duplicate_ads(interaction.guild, interaction.user.id, ad_type, item_val)
+
+    content = create_ad_text(interaction, item_val, price, ad_type)
+
+    # Build embed with optional photo / image
+    embed = discord.Embed(
+        title=item_val,
+        description=content,
+        color=discord.Color.from_rgb(115, 200, 255)
+    )
+    img = image_url or (photo.url if photo else None)
+    if img:
+        embed.set_thumbnail(url=img)
+
+    try:
+        message = await channel.send(embed=embed)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "❌ I don't have permission to send messages in that channel.",
+            ephemeral=True
+        )
+        return
+    except discord.HTTPException as e:
+        print(f"[AD MESSAGE] {e}")
+        await interaction.followup.send(
+            "❌ Discord failed to post the advertisement.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        ad_record = await api.create_ad(
+            {
+                "server_id": str(interaction.guild.id),
+                "owner_id": str(interaction.user.id),
+                "ad_type": ad_type,
+                "item": item_val,
+                "price": str(price),
+                "message_id": str(message.id),
+                "channel_id": str(channel.id),
+            }
+        )
+    except Exception as e:
+        print(f"[CREATE AD API] {e}")
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await interaction.followup.send(
+            "❌ The advertisement couldn't be saved to the backend.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        await message.edit(view=AdButtons(ad_record))
+    except Exception as e:
+        print(f"[AD BUTTONS] {e}")
+
+    await interaction.followup.send(
+        f"🟢 Your **{ad_type}** ad was posted in {channel.mention}.",
+        ephemeral=True
+    )
+
 
 class AdModal(discord.ui.Modal):
 
-    def __init__(
-        self,
-        ad_type
-    ):
-
+    def __init__(self, ad_type):
         super().__init__(
-            title=(
-                "🟢 Want To Buy"
-                if ad_type == "WTB"
-                else
-                "🔵 Want To Sell"
-            )
+            title=("🟢 Want To Buy" if ad_type == "WTB" else "🔵 Want To Sell")
         )
-
         self.ad_type = ad_type
-
         self.item_input = discord.ui.TextInput(
             label="Item",
             placeholder="Example: Inverted AWP",
             max_length=100,
             required=True
         )
-
         self.price_input = discord.ui.TextInput(
             label="Offer",
             placeholder="Example: $105.00, 2K Robux",
             max_length=20,
             required=True
         )
+        self.add_item(self.item_input)
+        self.add_item(self.price_input)
 
-        self.add_item(
-            self.item_input
-        )
-
-        self.add_item(
-            self.price_input
-        )
-
-
-    async def on_submit(
-        self,
-        interaction
-    ):
-
-        offer = self.price_input.value.strip()
-        if not offer:
-            await interaction.response.send_message(
-                "❌ Offer cannot be empty.",
-                ephemeral=True
-            )
-            return
-        price = offer
-
-        await interaction.response.defer(
-            ephemeral=True
-        )
-
-        if interaction.guild is None:
-
-            await interaction.followup.send(
-                (
-                    "❌ This command must be "
-                    "used inside a server."
-                ),
-                ephemeral=True
-            )
-
-            return
-
-        config = await get_server_config(
-            interaction.guild.id
-        )
-
-        if self.ad_type == "WTB":
-
-            channel_id = config.get(
-                "buying_channel_id"
-            )
-
-        else:
-
-            channel_id = config.get(
-                "selling_channel_id"
-            )
-
-        if not channel_id:
-
-            await interaction.followup.send(
-                (
-                    "❌ This marketplace channel "
-                    "isn't configured.\n"
-                    "Ask an administrator to "
-                    "run `/setup`."
-                ),
-                ephemeral=True
-            )
-
-            return
-
-        try:
-
-            channel = interaction.guild.get_channel(
-                int(channel_id)
-            )
-
-        except (TypeError, ValueError):
-
-            channel = None
-
-        if not channel:
-
-            await interaction.followup.send(
-                (
-                    "❌ The configured marketplace "
-                    "channel couldn't be found."
-                ),
-                ephemeral=True
-            )
-
-            return
-
-        item = self.item_input.value.strip()
-
-        await delete_duplicate_ads(interaction.guild, interaction.user.id, self.ad_type, item)
-
-        content = create_ad_text(interaction, item, price, self.ad_type)
-
-        # ----------------------------------------------------
-        # Send message first so we get its Discord ID.
-        # ----------------------------------------------------
-
-        try:
-
-            message = await channel.send(
-                embed=discord.Embed(
-                    title=item,
-                    description=content,
-                    color=discord.Color.from_rgb(115, 200, 255)
-                )
-            )
-
-        except discord.Forbidden:
-
-            await interaction.followup.send(
-                (
-                    "❌ I don't have permission "
-                    "to send messages in that channel."
-                ),
-                ephemeral=True
-            )
-
-            return
-
-        except discord.HTTPException as e:
-
-            print(
-                f"[AD MESSAGE] {e}"
-            )
-
-            await interaction.followup.send(
-                "❌ Discord failed to post the advertisement.",
-                ephemeral=True
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # Save ad to backend.
-        # ----------------------------------------------------
-
-        try:
-
-            ad_record = await api.create_ad(
-                {
-
-                    "server_id":
-                        str(interaction.guild.id),
-
-                    "owner_id":
-                        str(interaction.user.id),
-
-                    "ad_type":
-                        self.ad_type,
-
-                    "item":
-                        item,
-
-                    "price":
-                        str(price),
-
-                    "message_id":
-                        str(message.id),
-
-                    "channel_id":
-                        str(channel.id),
-
-                }
-            )
-
-        except Exception as e:
-
-            print(
-                f"[CREATE AD API] {e}"
-            )
-
-            try:
-
-                await message.delete()
-
-            except Exception:
-                pass
-
-            await interaction.followup.send(
-                (
-                    "❌ The advertisement couldn't "
-                    "be saved to the backend."
-                ),
-                ephemeral=True
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # Attach persistent buttons.
-        # ----------------------------------------------------
-
-        try:
-
-            await message.edit(
-                view=AdButtons(
-                    ad_record
-                )
-            )
-
-        except Exception as e:
-
-            print(
-                f"[AD BUTTONS] {e}"
-            )
-
-        await interaction.followup.send(
-            (
-                f"🟢 Your **{self.ad_type}** ad "
-                f"was posted in {channel.mention}."
-            ),
-            ephemeral=True
+    async def on_submit(self, interaction: discord.Interaction):
+        await post_ad(
+            interaction=interaction,
+            ad_type=self.ad_type,
+            item=self.item_input.value,
+            offer=self.price_input.value
         )
 
 
@@ -4003,12 +3913,26 @@ class AdModal(discord.ui.Modal):
     name="wtb",
     description="Create a Want To Buy advertisement."
 )
+@app_commands.describe(
+    item="Item name",
+    offer="Your offer (e.g. $105.00, 2K Robux)",
+    photo="Optional photo of the item",
+    image_url="Optional photo URL"
+)
 async def wtb(
-    interaction: discord.Interaction
+    interaction: discord.Interaction,
+    item: str,
+    offer: str,
+    photo: discord.Attachment = None,
+    image_url: str = None
 ):
-
-    await interaction.response.send_modal(
-        AdModal("WTB")
+    await post_ad(
+        interaction=interaction,
+        ad_type="WTB",
+        item=item,
+        offer=offer,
+        photo=photo,
+        image_url=image_url
     )
 
 
@@ -4020,14 +3944,27 @@ async def wtb(
     name="wts",
     description="Create a Want To Sell advertisement."
 )
+@app_commands.describe(
+    item="Item name",
+    offer="Your offer (e.g. $105.00, 2K Robux)",
+    photo="Optional photo of the item",
+    image_url="Optional photo URL"
+)
 async def wts(
-    interaction: discord.Interaction
+    interaction: discord.Interaction,
+    item: str,
+    offer: str,
+    photo: discord.Attachment = None,
+    image_url: str = None
 ):
-
-    await interaction.response.send_modal(
-        AdModal("WTS")
+    await post_ad(
+        interaction=interaction,
+        ad_type="WTS",
+        item=item,
+        offer=offer,
+        photo=photo,
+        image_url=image_url
     )
-
 
 # ============================================================
 # MIDDLEMAN (MM) FLOW
@@ -4643,6 +4580,33 @@ async def vouch_ticket(interaction: discord.Interaction):
     deal["state"] = "completed"
     save_vouch_state()
     save_mm_deals(_mm_deals)
+
+    # Restore send_messages permission so other MMs and participants can chat and close if needed
+    for raw_id in deal.get("tier_role_ids", []):
+        try:
+            role = interaction.guild.get_role(int(raw_id))
+            if role:
+                await interaction.channel.set_permissions(
+                    role,
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                )
+        except (TypeError, ValueError, discord.HTTPException) as e:
+            print(f"[VOUCH RESTORE ROLE PERMS] {e}")
+
+    for participant_id in deal.get("participants", []):
+        try:
+            member = interaction.guild.get_member(int(participant_id)) or await interaction.guild.fetch_member(int(participant_id))
+            if member:
+                await interaction.channel.set_permissions(
+                    member,
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                )
+        except (TypeError, ValueError, discord.HTTPException) as e:
+            print(f"[VOUCH RESTORE MEMBER PERMS] {e}")
 
 
 class MMRoleButton(discord.ui.Button):
@@ -6923,7 +6887,7 @@ class StockCog(commands.Cog):
         now_str = f"{now.month}/{now.day}/{str(now.year)[2:]}, {now.hour % 12 or 12}:{now.minute:02d} {'AM' if now.hour < 12 else 'PM'}"
         embed = discord.Embed(title=name.upper(), color=discord.Color.blurple())
         embed.add_field(name="💰 Price", value=price_str, inline=True)
-        embed.set_footer(text=f"SD Gems — Stock | {now_str}")
+        embed.set_footer(text=f"SDBST — Stock | {now_str}")
         if img:
             embed.set_thumbnail(url=img)
         post_id = uuid.uuid4().hex[:8]
