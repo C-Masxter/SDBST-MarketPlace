@@ -212,14 +212,51 @@ class MarketplaceAPI:
 
     async def create_ad(self, data):
 
-        response = await self.client.post(
-            "/api/public/bot/ads",
-            json=data
-        )
+        last_error = None
 
-        response.raise_for_status()
+        for attempt in range(3):
+            try:
+                response = await self.client.post(
+                    "/api/public/bot/ads",
+                    json=data
+                )
 
-        return response.json()
+                if response.status_code >= 400:
+                    last_error = RuntimeError(
+                        f"HTTP {response.status_code}: {response.text[:300]}"
+                    )
+                    print(f"[CREATE AD API] attempt {attempt + 1}: {last_error}")
+                    # 4xx (except 408/429) won't fix itself on retry
+                    if 400 <= response.status_code < 500 and response.status_code not in (408, 429):
+                        break
+                else:
+                    try:
+                        body = response.json()
+                    except Exception:
+                        body = {}
+
+                    # Backend may wrap the record: {"ad": {...}} / {"data": {...}}
+                    if isinstance(body, dict):
+                        for key in ("ad", "data", "record"):
+                            if isinstance(body.get(key), dict):
+                                body = body[key]
+                                break
+                    else:
+                        body = {}
+
+                    record = dict(data)
+                    record.update({k: v for k, v in body.items() if v is not None})
+                    if not record.get("ad_id"):
+                        record["ad_id"] = str(body.get("id") or uuid.uuid4())
+                    return record
+
+            except httpx.HTTPError as e:
+                last_error = e
+                print(f"[CREATE AD API] attempt {attempt + 1}: {e!r}")
+
+            await asyncio.sleep(1.5 * (attempt + 1))
+
+        raise last_error or RuntimeError("create_ad failed")
 
 
     async def get_ad(self, ad_id):
@@ -1260,6 +1297,9 @@ class SDBSTBot(commands.Bot):
                         bot.add_view(InactivityView(channel_id), message_id=int(state["prompt_message_id"]))
                     except Exception as e:
                         print(f"[RESTORE INACTIVITY VIEW] {e}")
+            global _auto_quote_task
+            if _auto_quote_task is None or _auto_quote_task.done():
+                _auto_quote_task = asyncio.create_task(auto_quote_loop())
             global _inactivity_task
             if _inactivity_task is None or _inactivity_task.done():
                 _inactivity_task = asyncio.create_task(inactivity_monitor())
@@ -1277,6 +1317,139 @@ class SDBSTBot(commands.Bot):
 
 
 bot = SDBSTBot()
+
+
+# ============================================================
+# QUOTES: /quote, /autoquote, /autoquote_stop
+# ============================================================
+
+QUOTES = [
+    ("The best time to plant a tree was 20 years ago. The second best time is now.", "Chinese Proverb"),
+    ("Do what you can, with what you have, where you are.", "Theodore Roosevelt"),
+    ("It always seems impossible until it's done.", "Nelson Mandela"),
+    ("Success is not final, failure is not fatal: it is the courage to continue that counts.", "Winston Churchill"),
+    ("Price is what you pay. Value is what you get.", "Warren Buffett"),
+    ("In the middle of difficulty lies opportunity.", "Albert Einstein"),
+    ("Don't watch the clock; do what it does. Keep going.", "Sam Levenson"),
+    ("The only way to do great work is to love what you do.", "Steve Jobs"),
+    ("Opportunities don't happen. You create them.", "Chris Grosser"),
+    ("A smooth sea never made a skilled sailor.", "Franklin D. Roosevelt"),
+    ("Fortune favors the bold.", "Virgil"),
+    ("Hard work beats talent when talent doesn't work hard.", "Tim Notke"),
+    ("Act as if what you do makes a difference. It does.", "William James"),
+    ("Small deeds done are better than great deeds planned.", "Peter Marshall"),
+    ("Dream big. Start small. Act now.", "Robin Sharma"),
+    ("The harder you work for something, the greater you'll feel when you achieve it.", "Unknown"),
+    ("Never trade what you want most for what you want now.", "Unknown"),
+    ("A good deal is when both sides walk away happy.", "Unknown"),
+    ("Patience is bitter, but its fruit is sweet.", "Aristotle"),
+    ("What you do today can improve all your tomorrows.", "Ralph Marston"),
+    ("Believe you can and you're halfway there.", "Theodore Roosevelt"),
+    ("Discipline is choosing between what you want now and what you want most.", "Abraham Lincoln"),
+    ("If you're going through hell, keep going.", "Winston Churchill"),
+    ("The secret of getting ahead is getting started.", "Mark Twain"),
+    ("Well done is better than well said.", "Benjamin Franklin"),
+]
+
+_auto_quote_task = None
+_last_quote_index = {}
+
+
+def pick_quote(key="global"):
+    idx = random.randrange(len(QUOTES))
+    if len(QUOTES) > 1 and _last_quote_index.get(key) == idx:
+        idx = (idx + 1) % len(QUOTES)
+    _last_quote_index[key] = idx
+    return QUOTES[idx]
+
+
+def build_quote_embed(key="global"):
+    text, author = pick_quote(key)
+    embed = discord.Embed(
+        description=f"💬 *\u201c{text}\u201d*\n\n— **{author}**",
+        color=discord.Color.from_rgb(115, 200, 255),
+    )
+    embed.set_footer(text="Quote of the moment")
+    return embed
+
+
+def _auto_quotes():
+    return _bot_config.setdefault("auto_quotes", {})
+
+
+@bot.tree.command(name="quote", description="Send a random quote.")
+async def quote_cmd(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        embed=build_quote_embed(str(interaction.channel_id))
+    )
+
+
+@bot.tree.command(name="autoquote", description="Automatically post a random quote in a channel every X minutes.")
+@app_commands.describe(
+    channel="Channel to post quotes in",
+    interval_minutes="How often to post (minutes, 5 - 10080)",
+)
+@app_commands.default_permissions(manage_guild=True)
+async def autoquote_cmd(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    interval_minutes: app_commands.Range[int, 5, 10080] = 60,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message("❌ Use this inside a server.", ephemeral=True)
+        return
+    _auto_quotes()[str(interaction.guild.id)] = {
+        "channel_id": str(channel.id),
+        "interval": int(interval_minutes),
+        "last_sent": 0,
+    }
+    save_bot_config(_bot_config)
+    await interaction.response.send_message(
+        f"✅ Auto-quote on: a random quote will post in {channel.mention} every **{interval_minutes}** min.\n"
+        "Use `/autoquote_stop` to turn it off.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="autoquote_stop", description="Turn off automatic quotes for this server.")
+@app_commands.default_permissions(manage_guild=True)
+async def autoquote_stop_cmd(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("❌ Use this inside a server.", ephemeral=True)
+        return
+    removed = _auto_quotes().pop(str(interaction.guild.id), None)
+    save_bot_config(_bot_config)
+    await interaction.response.send_message(
+        "🛑 Auto-quote turned off." if removed else "ℹ️ Auto-quote wasn't on.",
+        ephemeral=True,
+    )
+
+
+async def auto_quote_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            now = time.time()
+            changed = False
+            for guild_id, cfg in list(_auto_quotes().items()):
+                interval = max(5, int(cfg.get("interval", 60))) * 60
+                if now - float(cfg.get("last_sent", 0)) < interval:
+                    continue
+                channel = bot.get_channel(int(cfg["channel_id"]))
+                if channel is None:
+                    continue
+                try:
+                    await channel.send(embed=build_quote_embed(cfg["channel_id"]))
+                except Exception as e:
+                    print(f"[AUTO QUOTE] {guild_id}: {e}")
+                cfg["last_sent"] = now
+                changed = True
+            if changed:
+                save_bot_config(_bot_config)
+        except Exception as e:
+            print(f"[AUTO QUOTE LOOP] {e}")
+        await asyncio.sleep(30)
+
 
 ticket_group = app_commands.Group(name="ticket", description="Ticket statistics and management commands.")
 bot.tree.add_command(ticket_group)
@@ -3840,16 +4013,25 @@ async def post_ad(
             }
         )
     except Exception as e:
-        print(f"[CREATE AD API] {e}")
+        # Backend down / rejected: keep the ad live instead of deleting it.
+        # Save it locally so buttons still work and it can be synced later.
+        print(f"[CREATE AD API] giving up, saving locally: {e}")
+        ad_record = {
+            "ad_id": f"local-{uuid.uuid4()}",
+            "server_id": str(interaction.guild.id),
+            "owner_id": str(interaction.user.id),
+            "ad_type": ad_type,
+            "item": item_val,
+            "price": str(price),
+            "message_id": str(message.id),
+            "channel_id": str(channel.id),
+            "local_only": True,
+        }
         try:
-            await message.delete()
-        except Exception:
-            pass
-        await interaction.followup.send(
-            "❌ The advertisement couldn't be saved to the backend.",
-            ephemeral=True
-        )
-        return
+            _bot_config.setdefault("local_ads", {})[ad_record["ad_id"]] = ad_record
+            save_bot_config(_bot_config)
+        except Exception as save_err:
+            print(f"[LOCAL AD SAVE] {save_err}")
 
     try:
         await message.edit(view=AdButtons(ad_record))
