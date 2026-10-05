@@ -28,17 +28,14 @@ if not DISCORD_TOKEN:
         "DISCORD_TOKEN is missing from .env"
     )
 
+# The website backend is OPTIONAL now. If it's missing, down, or
+# rejecting requests, the bot saves everything locally in
+# backend_store.json and keeps working.
+MARKETPLACE_API_URL = (MARKETPLACE_API_URL or "").strip().rstrip("/")
+MARKETPLACE_API_KEY = (MARKETPLACE_API_KEY or "").strip()
+
 if not MARKETPLACE_API_URL:
-    raise RuntimeError(
-        "MARKETPLACE_API_URL is missing from .env"
-    )
-
-if not MARKETPLACE_API_KEY:
-    raise RuntimeError(
-        "MARKETPLACE_API_KEY is missing from .env"
-    )
-
-MARKETPLACE_API_URL = MARKETPLACE_API_URL.rstrip("/")
+    print("[BACKEND] MARKETPLACE_API_URL not set - running in local storage mode.")
 
 
 
@@ -68,312 +65,313 @@ def invalidate_server_config_cache(server_id=None):
         _server_config_cache.pop(str(server_id), None)
 
 
+BACKEND_STORE_FILE = Path("backend_store.json")
+
+
+class RemoteUnavailable(Exception):
+    pass
+
+
+class LocalBackendStore:
+    """Local copy of configs, ads and tickets so the bot never
+    depends on the website backend being online."""
+
+    def __init__(self, path):
+        self.path = path
+        self.data = {"configs": {}, "ads": {}, "tickets": {}}
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text())
+                if isinstance(loaded, dict):
+                    for key in self.data:
+                        if isinstance(loaded.get(key), dict):
+                            self.data[key] = loaded[key]
+            except Exception as e:
+                print(f"[LOCAL BACKEND LOAD] {e}")
+
+    def save(self):
+        try:
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.data, indent=2, default=str))
+            tmp.replace(self.path)
+        except Exception as e:
+            print(f"[LOCAL BACKEND SAVE] {e}")
+
+    @staticmethod
+    def now():
+        return datetime.now(timezone.utc).isoformat()
+
+
+def _unwrap(body, *keys):
+    if isinstance(body, dict):
+        for key in keys + ("data", "record"):
+            if isinstance(body.get(key), dict):
+                return body[key]
+        return body
+    return {}
+
+
 class MarketplaceAPI:
 
-    def __init__(self):
+    REMOTE_COOLDOWN = 120.0
 
+    def __init__(self):
+        self.enabled = bool(MARKETPLACE_API_URL)
         self.client = httpx.AsyncClient(
-            base_url=MARKETPLACE_API_URL,
-            headers={
-                "X-API-Key": MARKETPLACE_API_KEY
-            },
-            timeout=httpx.Timeout(
-                15.0,
-                connect=10.0
-            )
+            base_url=MARKETPLACE_API_URL or "http://localhost",
+            headers={"X-API-Key": MARKETPLACE_API_KEY} if MARKETPLACE_API_KEY else {},
+            timeout=httpx.Timeout(6.0, connect=4.0),
         )
+        self.store = LocalBackendStore(BACKEND_STORE_FILE)
+        self._down_until = 0.0
+        self.last_error = None
 
     async def close(self):
-
         if not self.client.is_closed:
             await self.client.aclose()
 
+    # ---------------- remote helper ----------------
 
-    async def health(self):
-
-        response = await self.client.get(
-            "/api/public/bot/health"
-        )
-
-        response.raise_for_status()
-
-        return response.json()
-
-
-    async def get_config(self, server_id):
-
-        response = await self.client.get(
-            f"/api/public/bot/config/{server_id}"
-        )
-
-        if response.status_code == 404:
+    async def _remote(self, method, path, allow_404=False, **kwargs):
+        if not self.enabled:
+            raise RemoteUnavailable("backend disabled")
+        if time.time() < self._down_until:
+            raise RemoteUnavailable(f"backend cooling down ({self.last_error})")
+        try:
+            response = await self.client.request(method, path, **kwargs)
+        except httpx.HTTPError as e:
+            self._mark_down(f"{type(e).__name__}: {e}")
+            raise RemoteUnavailable(str(e))
+        if response.status_code == 404 and allow_404:
+            return None
+        if response.status_code >= 400:
+            msg = f"{method} {path} -> HTTP {response.status_code}: {response.text[:300]}"
+            print(f"[BACKEND] {msg}")
+            if response.status_code >= 500 or response.status_code in (401, 403, 404, 405):
+                self._mark_down(msg)
+            raise RemoteUnavailable(msg)
+        try:
+            return response.json()
+        except Exception:
             return {}
 
-        response.raise_for_status()
+    def _mark_down(self, reason):
+        self.last_error = reason
+        self._down_until = time.time() + self.REMOTE_COOLDOWN
+        print(f"[BACKEND] unavailable, using local storage for {int(self.REMOTE_COOLDOWN)}s: {reason}")
 
-        data = response.json()
+    @staticmethod
+    def _is_local(record_id):
+        return str(record_id or "").startswith("local-")
 
-        if isinstance(data, dict):
+    # ---------------- health ----------------
 
-            # Some APIs return:
-            # {"config": {...}}
-            if isinstance(data.get("config"), dict):
-                return data["config"]
+    async def health(self):
+        try:
+            data = await self._remote("GET", "/api/public/bot/health")
+            if isinstance(data, dict):
+                data.setdefault("status", "ok")
+                data["mode"] = "remote"
+                return data
+        except RemoteUnavailable as e:
+            return {"status": "ok", "mode": "local", "remote_error": str(e)}
+        return {"status": "ok", "mode": "remote"}
 
-            return data
+    # ---------------- config ----------------
 
-        return {}
-
+    async def get_config(self, server_id):
+        sid = str(server_id)
+        local = dict(self.store.data["configs"].get(sid, {}))
+        try:
+            data = await self._remote("GET", f"/api/public/bot/config/{sid}", allow_404=True)
+            remote = _unwrap(data, "config") if data else {}
+            merged = dict(remote or {})
+            merged.update(local)
+            return merged
+        except RemoteUnavailable:
+            return local
 
     async def save_config(self, server_id, data):
-
         invalidate_server_config_cache(server_id)
-
-        response = await self.client.put(
-            f"/api/public/bot/config/{server_id}",
-            json=data
-        )
-
-        response.raise_for_status()
-
-        return response.json()
-
+        sid = str(server_id)
+        self.store.data["configs"][sid] = dict(data or {})
+        self.store.save()
+        try:
+            await self._remote("PUT", f"/api/public/bot/config/{sid}", json=data)
+        except RemoteUnavailable:
+            pass
+        return dict(data or {})
 
     async def patch_config(self, server_id, data):
-        """
-        Save individual config keys.
+        invalidate_server_config_cache(server_id)
+        sid = str(int(server_id))
+        current = self.store.data["configs"].setdefault(sid, {})
+        current.update(data or {})
+        self.store.save()
 
-        The backend may not support PATCH (or the config
-        record may not exist yet on first save), so do a
-        read-merge-write via PUT instead. This creates the
-        config on first save and updates single keys after.
-        """
-        current = {}
-
-        try:
-
-            current = await self.get_config(server_id)
-
-        except Exception as e:
-
-            print(f"[CONFIG READ] {e}")
-
-        if not isinstance(current, dict):
-
-            current = {}
-
-        current.update(data)
-
-        response = await self.client.put(
-            f"/api/public/bot/config/{server_id}",
-            json=current
-        )
-
-        response.raise_for_status()
-
-        # Also persist locally so settings survive even
-        # if the backend strips unknown keys.
-
-        gid = str(int(server_id))
-
-        if gid not in _bot_config:
-
-            _bot_config[gid] = {}
-
-        _bot_config[gid].update(data)
-
+        if sid not in _bot_config:
+            _bot_config[sid] = {}
+        _bot_config[sid].update(data or {})
         save_bot_config(_bot_config)
 
-        return response.json()
+        try:
+            remote = await self._remote("GET", f"/api/public/bot/config/{sid}", allow_404=True)
+            merged = dict(_unwrap(remote, "config") if remote else {})
+            merged.update(current)
+            await self._remote("PUT", f"/api/public/bot/config/{sid}", json=merged)
+        except RemoteUnavailable:
+            pass
+        return dict(current)
 
+    # ---------------- generic records ----------------
+
+    def _local_put(self, kind, record):
+        self.store.data[kind][record[self._id_key(kind)]] = record
+        self.store.save()
+        return record
+
+    @staticmethod
+    def _id_key(kind):
+        return "ad_id" if kind == "ads" else "ticket_id"
+
+    async def _list(self, kind, server_id, params):
+        sid = str(server_id)
+        id_key = self._id_key(kind)
+        results = []
+        seen = set()
+        try:
+            data = await self._remote("GET", f"/api/public/bot/{kind}", params=params)
+            if isinstance(data, dict):
+                data = data.get(kind, [])
+            for item in data if isinstance(data, list) else []:
+                if isinstance(item, dict):
+                    if not item.get(id_key) and item.get("id"):
+                        item[id_key] = str(item["id"])
+                    results.append(item)
+                    seen.add(str(item.get(id_key)))
+        except RemoteUnavailable:
+            pass
+        for rid, rec in self.store.data[kind].items():
+            if rid in seen or str(rec.get("server_id")) != sid:
+                continue
+            if rec.get("_deleted"):
+                continue
+            if kind == "tickets" and rec.get("status") == "closed":
+                continue
+            if kind == "ads" and rec.get("status") in ("completed", "sold", "done"):
+                continue
+            results.append({k: v for k, v in rec.items() if not k.startswith("_")})
+        return results
+
+    async def _create(self, kind, data):
+        id_key = self._id_key(kind)
+        record = dict(data or {})
+        try:
+            body = await self._remote("POST", f"/api/public/bot/{kind}", json=data)
+            body = _unwrap(body, kind[:-1])
+            record.update({k: v for k, v in body.items() if v is not None})
+            if not record.get(id_key):
+                record[id_key] = str(body.get("id") or f"local-{uuid.uuid4().hex}")
+        except RemoteUnavailable as e:
+            print(f"[BACKEND] {kind} saved locally instead: {e}")
+            record[id_key] = f"local-{uuid.uuid4().hex}"
+            record["local_only"] = True
+            record.setdefault("status", "open" if kind == "tickets" else "active")
+            record.setdefault("created_at", LocalBackendStore.now())
+        record[id_key] = str(record[id_key])
+        return self._local_put(kind, record)
+
+    async def _get(self, kind, record_id):
+        rid = str(record_id)
+        local = self.store.data[kind].get(rid)
+        if local and local.get("_deleted"):
+            return None
+        if self._is_local(rid):
+            return dict(local) if local else None
+        try:
+            data = await self._remote("GET", f"/api/public/bot/{kind}/{rid}", allow_404=True)
+            if data is None:
+                return dict(local) if local else None
+            data = _unwrap(data, kind[:-1])
+            merged = dict(local or {})
+            merged.update(data)
+            merged[self._id_key(kind)] = rid
+            return merged
+        except RemoteUnavailable:
+            return dict(local) if local else None
+
+    def _local_update(self, kind, rid, changes):
+        rec = self.store.data[kind].setdefault(rid, {self._id_key(kind): rid})
+        rec.update(changes or {})
+        rec["updated_at"] = LocalBackendStore.now()
+        self.store.save()
+        return dict(rec)
+
+    async def _update(self, kind, record_id, changes, remote_call):
+        rid = str(record_id)
+        merged = self._local_update(kind, rid, changes)
+        if not self._is_local(rid):
+            try:
+                body = await remote_call()
+                body = _unwrap(body, kind[:-1])
+                if body:
+                    merged.update(body)
+            except RemoteUnavailable:
+                pass
+        return merged
+
+    # ---------------- ads ----------------
 
     async def list_ads(self, server_id, limit=100):
-
-        response = await self.client.get(
-            "/api/public/bot/ads",
-            params={
-                "server_id": str(server_id),
-                "limit": limit
-            }
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        if isinstance(data, dict):
-            return data.get("ads", [])
-
-        if isinstance(data, list):
-            return data
-
-        return []
-
+        ads = await self._list("ads", server_id, {"server_id": str(server_id), "limit": limit})
+        return ads[:limit]
 
     async def create_ad(self, data):
-
-        last_error = None
-
-        for attempt in range(3):
-            try:
-                response = await self.client.post(
-                    "/api/public/bot/ads",
-                    json=data
-                )
-
-                if response.status_code >= 400:
-                    last_error = RuntimeError(
-                        f"HTTP {response.status_code}: {response.text[:300]}"
-                    )
-                    print(f"[CREATE AD API] attempt {attempt + 1}: {last_error}")
-                    # 4xx (except 408/429) won't fix itself on retry
-                    if 400 <= response.status_code < 500 and response.status_code not in (408, 429):
-                        break
-                else:
-                    try:
-                        body = response.json()
-                    except Exception:
-                        body = {}
-
-                    # Backend may wrap the record: {"ad": {...}} / {"data": {...}}
-                    if isinstance(body, dict):
-                        for key in ("ad", "data", "record"):
-                            if isinstance(body.get(key), dict):
-                                body = body[key]
-                                break
-                    else:
-                        body = {}
-
-                    record = dict(data)
-                    record.update({k: v for k, v in body.items() if v is not None})
-                    if not record.get("ad_id"):
-                        record["ad_id"] = str(body.get("id") or uuid.uuid4())
-                    return record
-
-            except httpx.HTTPError as e:
-                last_error = e
-                print(f"[CREATE AD API] attempt {attempt + 1}: {e!r}")
-
-            await asyncio.sleep(1.5 * (attempt + 1))
-
-        raise last_error or RuntimeError("create_ad failed")
-
+        return await self._create("ads", data)
 
     async def get_ad(self, ad_id):
-
-        response = await self.client.get(
-            f"/api/public/bot/ads/{ad_id}"
-        )
-
-        if response.status_code == 404:
-            return None
-
-        response.raise_for_status()
-
-        return response.json()
-
+        return await self._get("ads", ad_id)
 
     async def update_ad(self, ad_id, data):
-
-        response = await self.client.patch(
-            f"/api/public/bot/ads/{ad_id}",
-            json=data
+        return await self._update(
+            "ads", ad_id, data,
+            lambda: self._remote("PATCH", f"/api/public/bot/ads/{ad_id}", json=data),
         )
-
-        response.raise_for_status()
-
-        return response.json()
-
 
     async def complete_ad(self, ad_id):
-
-        response = await self.client.post(
-            f"/api/public/bot/ads/{ad_id}/complete"
+        return await self._update(
+            "ads", ad_id, {"status": "completed"},
+            lambda: self._remote("POST", f"/api/public/bot/ads/{ad_id}/complete"),
         )
-
-        response.raise_for_status()
-
-        return response.json()
-
 
     async def delete_ad(self, ad_id):
-
-        response = await self.client.delete(
-            f"/api/public/bot/ads/{ad_id}"
+        await self._update(
+            "ads", ad_id, {"_deleted": True, "status": "deleted"},
+            lambda: self._remote("DELETE", f"/api/public/bot/ads/{ad_id}"),
         )
 
-        response.raise_for_status()
-
+    # ---------------- tickets ----------------
 
     async def list_tickets(self, server_id):
-
-        response = await self.client.get(
-            "/api/public/bot/tickets",
-            params={
-                "server_id": str(server_id)
-            }
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        if isinstance(data, dict):
-            return data.get("tickets", [])
-
-        if isinstance(data, list):
-            return data
-
-        return []
-
+        return await self._list("tickets", server_id, {"server_id": str(server_id)})
 
     async def create_ticket(self, data):
-
-        response = await self.client.post(
-            "/api/public/bot/tickets",
-            json=data
-        )
-
-        response.raise_for_status()
-
-        return response.json()
-
+        return await self._create("tickets", data)
 
     async def get_ticket(self, ticket_id):
-
-        response = await self.client.get(
-            f"/api/public/bot/tickets/{ticket_id}"
-        )
-
-        if response.status_code == 404:
-            return None
-
-        response.raise_for_status()
-
-        return response.json()
-
+        return await self._get("tickets", ticket_id)
 
     async def update_ticket(self, ticket_id, data):
-
-        response = await self.client.patch(
-            f"/api/public/bot/tickets/{ticket_id}",
-            json=data
+        return await self._update(
+            "tickets", ticket_id, data,
+            lambda: self._remote("PATCH", f"/api/public/bot/tickets/{ticket_id}", json=data),
         )
-
-        response.raise_for_status()
-
-        return response.json()
-
 
     async def close_ticket(self, ticket_id):
-
-        response = await self.client.post(
-            f"/api/public/bot/tickets/{ticket_id}/close"
+        return await self._update(
+            "tickets", ticket_id, {"status": "closed", "closed_at": LocalBackendStore.now()},
+            lambda: self._remote("POST", f"/api/public/bot/tickets/{ticket_id}/close"),
         )
-
-        response.raise_for_status()
-
-        return response.json()
 
 
 api = MarketplaceAPI()
@@ -1300,6 +1298,9 @@ class SDBSTBot(commands.Bot):
             global _auto_quote_task
             if _auto_quote_task is None or _auto_quote_task.done():
                 _auto_quote_task = asyncio.create_task(auto_quote_loop())
+            global _auto_qotd_task
+            if _auto_qotd_task is None or _auto_qotd_task.done():
+                _auto_qotd_task = asyncio.create_task(auto_qotd_loop())
             global _inactivity_task
             if _inactivity_task is None or _inactivity_task.done():
                 _inactivity_task = asyncio.create_task(inactivity_monitor())
@@ -1349,6 +1350,31 @@ QUOTES = [
     ("If you're going through hell, keep going.", "Winston Churchill"),
     ("The secret of getting ahead is getting started.", "Mark Twain"),
     ("Well done is better than well said.", "Benjamin Franklin"),
+    ('You miss 100 percent of the shots you do not take.', 'Wayne Gretzky'),
+    ('Nothing will work unless you do.', 'Maya Angelou'),
+    ('It is never too late to be what you might have been.', 'George Eliot'),
+    ('What we think, we become.', 'Buddha'),
+    ('Turn your wounds into wisdom.', 'Oprah Winfrey'),
+    ('The journey of a thousand miles begins with a single step.', 'Lao Tzu'),
+    ('We are what we repeatedly do. Excellence, then, is not an act, but a habit.', 'Will Durant'),
+    ('Life is what happens when you are busy making other plans.', 'John Lennon'),
+    ('No one can make you feel inferior without your consent.', 'Eleanor Roosevelt'),
+    ('If opportunity does not knock, build a door.', 'Milton Berle'),
+    ('The future depends on what you do today.', 'Mahatma Gandhi'),
+    ('Energy and persistence conquer all things.', 'Benjamin Franklin'),
+    ('Everything you can imagine is real.', 'Pablo Picasso'),
+    ('Try not to become a man of success, but rather try to become a man of value.', 'Albert Einstein'),
+    ('Knowing is not enough; we must apply. Willing is not enough; we must do.', 'Johann Wolfgang von Goethe'),
+    ('You cannot use up creativity. The more you use, the more you have.', 'Maya Angelou'),
+    ('The way to get started is to quit talking and begin doing.', 'Walt Disney'),
+    ('Keep your face always toward the sunshine, and shadows will fall behind you.', 'Walt Whitman'),
+    ('Be yourself; everyone else is already taken.', 'Oscar Wilde'),
+    ('A little progress each day adds up to big results.', 'Unknown'),
+    ('You do not have to be perfect to be amazing.', 'Unknown'),
+    ('Rest if you must, but do not quit.', 'Unknown'),
+    ('Your direction matters more than your speed.', 'Unknown'),
+    ('Start where you are. Use what you have. Do what you can.', 'Arthur Ashe'),
+    ('The most effective way to do it, is to do it.', 'Amelia Earhart'),
 ]
 
 _auto_quote_task = None
@@ -1366,7 +1392,8 @@ def pick_quote(key="global"):
 def build_quote_embed(key="global"):
     text, author = pick_quote(key)
     embed = discord.Embed(
-        description=f"💬 *\u201c{text}\u201d*\n\n— **{author}**",
+        title=f"💬 \u201c{text}\u201d",
+        description=f"— **{author}**",
         color=discord.Color.from_rgb(115, 200, 255),
     )
     embed.set_footer(text="Quote of the moment")
@@ -1448,6 +1475,225 @@ async def auto_quote_loop():
                 save_bot_config(_bot_config)
         except Exception as e:
             print(f"[AUTO QUOTE LOOP] {e}")
+        await asyncio.sleep(30)
+
+
+# ============================================================
+# QUESTION OF THE DAY: /qotd, /autoqotd, /autoqotd_stop
+# ============================================================
+
+QOTD_QUESTIONS = [
+    'If you could have one superpower for a day, what would it be?',
+    'What song always puts you in a good mood?',
+    'Which game could you play for hours without getting bored?',
+    'If you could travel anywhere tomorrow, where would you go?',
+    'What is your favorite snack during a gaming session?',
+    'What skill would you love to learn instantly?',
+    'Would you rather explore space or the deep ocean?',
+    'What is one small thing that made you smile recently?',
+    'Which fictional world would you want to live in?',
+    'What is the best advice you have ever received?',
+    'If you could invent a new holiday, what would it celebrate?',
+    'What is your favorite movie to rewatch?',
+    'Which animal would make the funniest roommate?',
+    'What food could you eat every day for a week?',
+    'If your life had a theme song, what would it be?',
+    'What is something you are looking forward to?',
+    'Would you rather time travel to the past or the future?',
+    'What was your first video game?',
+    'Which app do you use the most, besides Discord?',
+    'What is your favorite way to spend a rainy day?',
+    'If you could master any instrument, which would you choose?',
+    'What is your most underrated hobby?',
+    'Which game has the best soundtrack?',
+    'What is your dream weekend plan?',
+    'If you owned a restaurant, what would its signature dish be?',
+    'What is the funniest thing a pet has done around you?',
+    'Would you rather always have perfect weather or never wait in a queue?',
+    'What fictional character would you invite to dinner?',
+    'What is a goal you want to work toward this year?',
+    'What is the best gift you have ever received?',
+    'If you could rename one everyday object, what would you call it?',
+    'What is your favorite season, and why?',
+    'Which game deserves a sequel?',
+    'What is one thing you wish schools taught?',
+    'Would you rather be amazing at cooking or every sport?',
+    'What is your go-to comfort food?',
+    'If you could make one rule for the whole world, what would it be?',
+    'What is a movie or show you think more people should watch?',
+    'Which three items would you take to a deserted island?',
+    'What is something you were surprised to enjoy?',
+    'If you could swap lives with a fictional character for a day, who would it be?',
+    'What is your favorite childhood memory you feel comfortable sharing?',
+    'Which gaming achievement are you proudest of?',
+    'Would you rather have a flying car or a teleportation door?',
+    'What is a tiny inconvenience you wish you could remove forever?',
+    'What is your favorite ice cream flavor?',
+    'If you started a podcast, what would it be about?',
+    'Which fictional villain has the best design?',
+    'What is the coolest place you have visited?',
+    'What is something kind someone did for you recently?',
+    'If animals could talk, which would be the most sarcastic?',
+    'What is your ideal breakfast?',
+    'Which game would you recommend to a complete beginner?',
+    'Would you rather be able to speak every language or play every instrument?',
+    'What is something you made that you are proud of?',
+    'What is your favorite board game or card game?',
+    'If you had a robot helper, what task would you give it first?',
+    'What is the best meal you have ever had?',
+    'Which fictional vehicle would you want to drive?',
+    'What is one habit you would like to build?',
+    'If you could design a new game, what would its main idea be?',
+    'What is a harmless unpopular opinion you have?',
+    'Which emoji best describes your day?',
+    'Would you rather have unlimited books or unlimited games?',
+    'What is your favorite thing about your hometown?',
+    'What is a talent people might not know you have?',
+    'If you could bring back one discontinued snack, what would it be?',
+    'What is the most useful thing you bought recently?',
+    'Which superhero has the most practical power?',
+    'What is your favorite way to relax after a busy day?',
+    'If you could create a new emoji, what would it look like?',
+    'What is the best plot twist you have seen, without spoiling it?',
+    'Which game has the most beautiful map?',
+    'Would you rather live in a treehouse or a houseboat?',
+    'What is a topic you could talk about for hours?',
+    'What is your favorite pizza topping combination?',
+    'If you could visit any historical event safely, which would you choose?',
+    'What is something new you tried recently?',
+    'Which character would be the best teammate in a game?',
+    'What is one thing that makes a community welcoming?',
+    'If you had to give a ten-minute talk with no preparation, what would it be about?',
+    'What is your favorite sound?',
+    'Which game mechanic do you wish more games used?',
+    'Would you rather have a personal chef or a personal driver?',
+    'What is the funniest username you have seen, without tagging anyone?',
+    'What is your favorite thing to do outdoors?',
+    'If you could shrink one object to fit in your pocket, what would it be?',
+    'What is one book, video, or creator that taught you something useful?',
+    'Which fictional creature would you want as a companion?',
+    'What is one thing you appreciate about today?',
+    'If you could make any chore disappear, which would you choose?',
+    'What is your favorite multiplayer memory?',
+    'Which color would you choose for your dream room?',
+    'Would you rather win a talent show or a sports championship?',
+    'What is something you want to try but have not yet?',
+    'What is your favorite dessert?',
+    'If you could add one feature to Discord, what would it be?',
+    "What is one simple way to brighten someone else's day?",
+    'Which game would you love to experience again for the first time?',
+    'What would you name a spaceship if you owned one?',
+]
+_auto_qotd_task = None
+
+
+def _auto_qotds():
+    return _bot_config.setdefault("auto_qotds", {})
+
+
+def pick_qotd(key="global"):
+    # Persist a shuffled deck: every question appears before the deck repeats.
+    state = _bot_config.setdefault("qotd_decks", {}).setdefault(str(key), {})
+    remaining = state.get("remaining", [])
+    if not isinstance(remaining, list) or not remaining or any(
+        not isinstance(i, int) or not 0 <= i < len(QOTD_QUESTIONS) for i in remaining
+    ):
+        remaining = list(range(len(QOTD_QUESTIONS)))
+        random.shuffle(remaining)
+        if len(remaining) > 1 and remaining[-1] == state.get("last"):
+            remaining[-1], remaining[0] = remaining[0], remaining[-1]
+    idx = remaining.pop()
+    state.update(remaining=remaining, last=idx)
+    save_bot_config(_bot_config)
+    return QOTD_QUESTIONS[idx]
+
+
+def build_qotd_embed(key="global"):
+    embed = discord.Embed(
+        title=pick_qotd(key),
+        description="💭 **Question of the day**",
+        color=discord.Color.from_rgb(115, 200, 255),
+    )
+    return embed
+
+
+def can_post_daily(channel):
+    member = channel.guild.me
+    if member is None:
+        return False
+    permissions = channel.permissions_for(member)
+    return permissions.view_channel and permissions.send_messages and permissions.embed_links
+
+
+@bot.tree.command(name="qotd", description="Send a random question of the day.")
+async def qotd_cmd(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        embed=build_qotd_embed(str(interaction.channel_id))
+    )
+
+
+@bot.tree.command(name="autoqotd", description="Post a question now, then automatically every 24 hours.")
+@app_commands.describe(channel="Channel for the daily question")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def autoqotd_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
+    if interaction.guild is None:
+        await interaction.response.send_message("❌ Use this inside a server.", ephemeral=True)
+        return
+    if channel.guild.id != interaction.guild.id or not can_post_daily(channel):
+        await interaction.response.send_message(
+            "❌ I need View Channel, Send Messages, and Embed Links in that channel.",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await channel.send(embed=build_qotd_embed(str(channel.id)))
+    except discord.HTTPException as e:
+        print(f"[AUTO QOTD SETUP] {interaction.guild.id}: {e}")
+        await interaction.followup.send("❌ I couldn't post there. Auto-QOTD was not changed.", ephemeral=True)
+        return
+    _auto_qotds()[str(interaction.guild.id)] = {
+        "channel_id": str(channel.id),
+        "last_sent": time.time(),
+    }
+    save_bot_config(_bot_config)
+    await interaction.followup.send(
+        f"✅ Daily questions are on in {channel.mention}: one posted now, then every **24 hours**. "
+        "Use `/autoqotd_stop` to turn them off.", ephemeral=True,
+    )
+
+
+@bot.tree.command(name="autoqotd_stop", description="Turn off automatic daily questions for this server.")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def autoqotd_stop_cmd(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("❌ Use this inside a server.", ephemeral=True)
+        return
+    removed = _auto_qotds().pop(str(interaction.guild.id), None)
+    save_bot_config(_bot_config)
+    await interaction.response.send_message(
+        "🛑 Daily questions turned off." if removed else "ℹ️ Daily questions weren't on.",
+        ephemeral=True,
+    )
+
+
+async def auto_qotd_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        for guild_id, cfg in list(_auto_qotds().items()):
+            try:
+                if time.time() - float(cfg.get("last_sent", 0)) < 86400:
+                    continue
+                channel = bot.get_channel(int(cfg["channel_id"]))
+                if not isinstance(channel, discord.TextChannel) or not can_post_daily(channel):
+                    continue
+                await channel.send(embed=build_qotd_embed(str(channel.id)))
+                cfg["last_sent"] = time.time()
+                save_bot_config(_bot_config)
+            except Exception as e:
+                print(f"[AUTO QOTD] {guild_id}: {e}")
         await asyncio.sleep(30)
 
 
