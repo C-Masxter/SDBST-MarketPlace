@@ -1188,6 +1188,11 @@ class SDBSTBot(commands.Bot):
         except Exception as e:
             print(f"[STOCK COG] {e}")
 
+        try:
+            register_extra_views(self)
+        except Exception as e:
+            print(f"[EXTRA VIEWS] {e}")
+
         for guild_id in COMMAND_GUILD_IDS:
 
             guild = discord.Object(
@@ -4985,6 +4990,12 @@ async def vouch_ticket(interaction: discord.Interaction):
         f"Sample vouch format: `Vouch mm {mm_mention} {amount} deal fast and easy`",
         allowed_mentions=discord.AllowedMentions(users=True),
     )
+    try:
+        deal_amount = await record_completed_deal(interaction.guild, deal, [buyer_id, seller_id])
+        save_mm_deals(_mm_deals)
+        await send_rate_message(interaction.channel, interaction.guild, buyer_id, seller_id, deal_amount)
+    except Exception as e:
+        print(f"[PROFILE/RATE] {e}")
     timeout = int(config.get("vouch_timeout_seconds") or 86400)
     _vouch_state[deal_id] = {
         "deadline": time.time() + timeout,
@@ -6646,6 +6657,7 @@ async def on_message(message):
     if not message.author.bot and config.get("vouches_channel_id"):
         try:
             if message.channel.id == int(config["vouches_channel_id"]):
+                count_vouch_mentions(message)
                 text = (message.content or "").lower()
                 if "vouch" in text:
                     changed = False
@@ -6658,6 +6670,10 @@ async def on_message(message):
                         save_vouch_state()
         except (TypeError, ValueError):
             pass
+    try:
+        await stocker_on_message(message)
+    except Exception as e:
+        print(f"[STOCKER ON_MESSAGE] {e}")
     is_mm_channel = any(
         str(deal.get("ticket_channel_id")) == str(message.channel.id)
         for deal in _mm_deals.values()
@@ -7341,6 +7357,508 @@ class StockCog(commands.Cog):
 # ============================================================
 # RUN
 # ============================================================
+
+
+
+# ============================================================
+# PROFILES, RATINGS, VOUCH LEADERBOARD, STOCKER CHANNELS
+# ============================================================
+
+PROFILES_FILE = Path("profiles.json")
+STOCKERS_FILE = Path("stockers.json")
+
+# Rank tiers by total $ traded through MM. Edit freely.
+# If a role with the same name exists in the server, the bot gives it
+# (and removes the lower tier roles).
+RANK_TIERS = [
+    (0, "Bronze Client"),
+    (100, "Silver Client"),
+    (500, "Gold Client"),
+    (1000, "Platinum Client"),
+    (2500, "Diamond Client"),
+    (5000, "Elite Client"),
+]
+
+STOCKER_CATEGORY_NAME = "stockers channel"
+STOCKER_CHANNEL_PREFIX = "🪎│"
+
+_profiles = _load_json_file(PROFILES_FILE) or {}
+_stockers = _load_json_file(STOCKERS_FILE) or {}
+if not isinstance(_profiles, dict):
+    _profiles = {}
+if not isinstance(_stockers, dict):
+    _stockers = {}
+_profiles.setdefault("guilds", {})
+_profiles.setdefault("rate_requests", {})
+_stockers.setdefault("channels", {})
+_stockers.setdefault("negotiations", {})
+
+
+def save_profiles():
+    _save_json_file(PROFILES_FILE, _profiles)
+
+
+def save_stockers():
+    _save_json_file(STOCKERS_FILE, _stockers)
+
+
+def profile_for(guild_id, user_id):
+    guild = _profiles["guilds"].setdefault(str(guild_id), {})
+    return guild.setdefault(str(user_id), {
+        "deal_total": 0.0,
+        "deal_count": 0,
+        "vouches": 0,
+        "ratings": [],
+    })
+
+
+def parse_amount(value):
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    match = re.search(r"\d[\d,]*(?:\.\d+)?", str(value))
+    if not match:
+        return 0.0
+    try:
+        return float(match.group(0).replace(",", ""))
+    except ValueError:
+        return 0.0
+
+
+def rank_for_total(total):
+    current = RANK_TIERS[0][1]
+    for threshold, name in RANK_TIERS:
+        if total >= threshold:
+            current = name
+    return current
+
+
+def fmt_money(value):
+    value = float(value or 0)
+    return f"${int(value):,}" if value == int(value) else f"${value:,.2f}"
+
+
+async def apply_rank_role(guild, member, total):
+    """Give the matching rank role (if it exists) and remove the other tier roles."""
+    if guild is None or member is None:
+        return
+    wanted = rank_for_total(total).lower()
+    tier_names = {name.lower() for _, name in RANK_TIERS}
+    to_add, to_remove = [], []
+    for role in guild.roles:
+        name = role.name.lower()
+        if name not in tier_names:
+            continue
+        if name == wanted and role not in member.roles:
+            to_add.append(role)
+        elif name != wanted and role in member.roles:
+            to_remove.append(role)
+    try:
+        if to_remove:
+            await member.remove_roles(*to_remove, reason="Rank update")
+        if to_add:
+            await member.add_roles(*to_add, reason="Rank update")
+    except discord.HTTPException as e:
+        print(f"[RANK ROLE] {e}")
+
+
+async def record_completed_deal(guild, deal, user_ids):
+    """Add the deal amount to each participant's profile (once per deal)."""
+    deal_key = str(deal.get("deal_id") or deal.get("ticket_channel_id") or id(deal))
+    if deal.get("profile_recorded"):
+        return parse_amount(deal.get("price"))
+    amount = parse_amount(deal.get("price")) or parse_amount(extract_price_from_text(deal.get("deal_text") or ""))
+    for uid in {str(u) for u in user_ids if u}:
+        p = profile_for(guild.id, uid)
+        p["deal_total"] = float(p.get("deal_total") or 0) + amount
+        p["deal_count"] = int(p.get("deal_count") or 0) + 1
+        try:
+            member = guild.get_member(int(uid)) or await guild.fetch_member(int(uid))
+            await apply_rank_role(guild, member, p["deal_total"])
+        except (discord.HTTPException, ValueError):
+            pass
+    deal["profile_recorded"] = True
+    save_profiles()
+    print(f"[PROFILE] Recorded deal {deal_key} amount={amount}")
+    return amount
+
+
+# ---------------- Rating buttons (1-5) ----------------
+
+RATE_EMOJIS = {1: "⭐", 2: "🤩", 3: "✨", 4: "🌟", 5: "🌠"}
+
+
+class RateButton(discord.ui.Button):
+    def __init__(self, stars):
+        super().__init__(
+            label=str(stars),
+            emoji=RATE_EMOJIS[stars],
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"sdbst:rate:{stars}",
+        )
+        self.stars = stars
+
+    async def callback(self, interaction: discord.Interaction):
+        req = _profiles["rate_requests"].get(str(interaction.message.id))
+        if not req:
+            await interaction.response.send_message("❌ This rating is no longer active.", ephemeral=True)
+            return
+        uid = str(interaction.user.id)
+        pair = req.get("pair", {})
+        if uid not in pair:
+            await interaction.response.send_message("❌ Only the buyer and seller of this deal can rate.", ephemeral=True)
+            return
+        if uid in req.get("rated", []):
+            await interaction.response.send_message("✅ You already rated this trade.", ephemeral=True)
+            return
+        target_id = pair[uid]
+        p = profile_for(req["guild_id"], target_id)
+        p.setdefault("ratings", []).append(self.stars)
+        req.setdefault("rated", []).append(uid)
+        if len(req["rated"]) >= len(pair):
+            _profiles["rate_requests"].pop(str(interaction.message.id), None)
+        save_profiles()
+        avg = sum(p["ratings"]) / len(p["ratings"])
+        await interaction.response.send_message(
+            f"✅ You rated <@{target_id}> **{self.stars}/5**. Their average is now **{avg:.1f}**.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+class RateView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        for stars in range(1, 6):
+            self.add_item(RateButton(stars))
+
+
+async def send_rate_message(channel, guild, buyer_id, seller_id, amount):
+    embed = discord.Embed(
+        title="⭐ Rate the other trader",
+        description=(
+            f"Deal completed: **{fmt_money(amount)}**\n\n"
+            f"<@{buyer_id}> rate the seller, <@{seller_id}> rate the buyer.\n"
+            f"Tap a button from **1** (bad) to **5** (excellent)."
+        ),
+        color=discord.Color.gold(),
+    )
+    msg = await channel.send(embed=embed, view=RateView())
+    _profiles["rate_requests"][str(msg.id)] = {
+        "guild_id": str(guild.id),
+        "pair": {str(buyer_id): str(seller_id), str(seller_id): str(buyer_id)},
+        "rated": [],
+    }
+    save_profiles()
+
+
+# ---------------- /profile and /vouchrank ----------------
+
+@bot.tree.command(name="profile", description="Show a member's trading profile.")
+@app_commands.describe(member="Member to look up (leave empty for yourself)")
+async def profile_cmd(interaction: discord.Interaction, member: discord.Member = None):
+    if interaction.guild is None:
+        await safe_error(interaction, "❌ Use this command in a server.")
+        return
+    member = member or interaction.user
+    p = profile_for(interaction.guild.id, member.id)
+    ratings = p.get("ratings") or []
+    rate = f"{sum(ratings) / len(ratings):.1f} ({len(ratings)} rating{'s' if len(ratings) != 1 else ''})" if ratings else "No ratings yet"
+    total = float(p.get("deal_total") or 0)
+    count = int(p.get("deal_count") or 0)
+    embed = discord.Embed(title=f"{member.display_name}'s profile", color=discord.Color.blurple())
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.description = (
+        f"{member.mention}\n"
+        f"**Discord user id:** {member.id}\n"
+        f"**Deals done:** {fmt_money(total)} {count} deal{'s' if count != 1 else ''}\n"
+        f"**Rank:** {rank_for_total(total)}\n"
+        f"**Vouches in this server:** {int(p.get('vouches') or 0)} vouches\n"
+        f"**Rate from others:** {rate}"
+    )
+    await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.tree.command(name="vouchrank", description="Top 20 members with the most vouches in this server.")
+async def vouchrank_cmd(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await safe_error(interaction, "❌ Use this command in a server.")
+        return
+    await interaction.response.defer()
+    guild_data = _profiles["guilds"].get(str(interaction.guild.id), {})
+    ranked = sorted(
+        ((uid, int(d.get("vouches") or 0)) for uid, d in guild_data.items() if int(d.get("vouches") or 0) > 0),
+        key=lambda x: -x[1],
+    )[:20]
+    if not ranked:
+        await interaction.followup.send("📊 No vouches recorded yet.")
+        return
+    lines = []
+    for i, (uid, total) in enumerate(ranked, start=1):
+        member = interaction.guild.get_member(int(uid))
+        if member is None:
+            try:
+                member = await interaction.guild.fetch_member(int(uid))
+            except discord.HTTPException:
+                member = None
+        name = member.display_name if member else f"User {uid}"
+        lines.append(f"{i}. __**{name}**__ has **{total}** vouch{'es' if total != 1 else ''}")
+    await interaction.followup.send(
+        "🏆 **Vouch rankings — Top 20**\n\n" + "\n".join(lines),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.tree.command(name="profile_edit", description="(Admin) Change a member's profile numbers.")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(member="Member", deal_total="Total $ traded", deal_count="Number of deals", vouches="Vouch count")
+async def profile_edit_cmd(interaction: discord.Interaction, member: discord.Member,
+                           deal_total: float = None, deal_count: int = None, vouches: int = None):
+    p = profile_for(interaction.guild.id, member.id)
+    if deal_total is not None:
+        p["deal_total"] = max(0.0, deal_total)
+    if deal_count is not None:
+        p["deal_count"] = max(0, deal_count)
+    if vouches is not None:
+        p["vouches"] = max(0, vouches)
+    save_profiles()
+    await apply_rank_role(interaction.guild, member, float(p["deal_total"]))
+    await interaction.response.send_message(f"✅ Updated {member.mention}'s profile.", ephemeral=True,
+                                            allowed_mentions=discord.AllowedMentions.none())
+
+
+def count_vouch_mentions(message):
+    """Every message in the vouches channel that mentions someone = +1 vouch for each person mentioned."""
+    changed = False
+    for user in {u for u in message.mentions if not u.bot and u.id != message.author.id}:
+        p = profile_for(message.guild.id, user.id)
+        p["vouches"] = int(p.get("vouches") or 0) + 1
+        changed = True
+    if changed:
+        save_profiles()
+
+
+# ---------------- /stocker channels ----------------
+
+def stocker_embed(stocker_id):
+    return discord.Embed(
+        description=(
+            f"📌 This channel is for <@{stocker_id}> stock.\n"
+            f"If you want to buy skins or negotiate with him, click the button below."
+        ),
+        color=discord.Color.green(),
+    )
+
+
+class StockerBuyButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Buy skin / Offer", emoji="🛒",
+                         style=discord.ButtonStyle.success, custom_id="sdbst:stocker:buy")
+
+    async def callback(self, interaction: discord.Interaction):
+        info = _stockers["channels"].get(str(interaction.channel.id))
+        if not info:
+            await interaction.response.send_message("❌ This stocker channel is no longer active.", ephemeral=True)
+            return
+        guild = interaction.guild
+        buyer = interaction.user
+        if str(buyer.id) == info["stocker_id"]:
+            await interaction.response.send_message("❌ You can't open a deal with yourself.", ephemeral=True)
+            return
+        for ch_id, neg in _stockers["negotiations"].items():
+            if neg["buyer_id"] == str(buyer.id) and neg["stock_channel_id"] == str(interaction.channel.id) and guild.get_channel(int(ch_id)):
+                await interaction.response.send_message(f"You already have an open deal: <#{ch_id}>", ephemeral=True)
+                return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            stocker = guild.get_member(int(info["stocker_id"])) or await guild.fetch_member(int(info["stocker_id"]))
+        except discord.HTTPException:
+            await interaction.followup.send("❌ The stocker is no longer in this server.", ephemeral=True)
+            return
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            buyer: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True),
+            stocker: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True),
+        }
+        try:
+            channel = await guild.create_text_channel(
+                name=f"deal-{safe_name(buyer.display_name)}-{safe_name(stocker.display_name)}"[:95],
+                category=interaction.channel.category,
+                overwrites=overwrites,
+                topic=f"Stocker negotiation • buyer {buyer.id} • stocker {stocker.id}",
+            )
+        except discord.HTTPException as e:
+            print(f"[STOCKER NEGOTIATION] {e}")
+            await interaction.followup.send("❌ I couldn't create the negotiation channel (missing permission?).", ephemeral=True)
+            return
+        _stockers["negotiations"][str(channel.id)] = {
+            "guild_id": str(guild.id),
+            "buyer_id": str(buyer.id),
+            "stocker_id": str(stocker.id),
+            "stock_channel_id": str(interaction.channel.id),
+        }
+        save_stockers()
+        embed = discord.Embed(
+            title="🛒 Stock negotiation opened",
+            description=(
+                f"**Buyer:** {buyer.mention}\n**Stocker:** {stocker.mention}\n\n"
+                f"💬 Negotiate the deal privately here. Use `/mm` when you're ready for a middleman."
+            ),
+            color=discord.Color.green(),
+        )
+        await channel.send(content=f"{buyer.mention} {stocker.mention}", embed=embed, view=StockerNegotiationView(),
+                           allowed_mentions=discord.AllowedMentions(users=True))
+        await interaction.followup.send(f"✅ Deal channel created: {channel.mention}", ephemeral=True)
+
+
+class StockerStickyView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(StockerBuyButton())
+
+
+class StockerCloseButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Close", emoji="🔒", style=discord.ButtonStyle.danger,
+                         custom_id="sdbst:stocker:close")
+
+    async def callback(self, interaction: discord.Interaction):
+        neg = _stockers["negotiations"].get(str(interaction.channel.id))
+        allowed = interaction.user.guild_permissions.manage_channels or (
+            neg and str(interaction.user.id) in (neg["buyer_id"], neg["stocker_id"]))
+        if not allowed:
+            await interaction.response.send_message("❌ You can't close this channel.", ephemeral=True)
+            return
+        await interaction.response.send_message("🔒 Closing in 5 seconds...")
+        await asyncio.sleep(5)
+        _stockers["negotiations"].pop(str(interaction.channel.id), None)
+        save_stockers()
+        try:
+            await interaction.channel.delete(reason=f"Closed by {interaction.user}")
+        except discord.HTTPException as e:
+            print(f"[STOCKER CLOSE] {e}")
+
+
+class StockerNegotiationView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(StockerCloseButton())
+
+
+_stocker_sticky_last = {}
+_stocker_sticky_busy = set()
+
+
+async def refresh_stocker_sticky(channel):
+    """Keep the embed + button as the last message in the stocker channel."""
+    info = _stockers["channels"].get(str(channel.id))
+    if not info or channel.id in _stocker_sticky_busy:
+        return
+    if time.time() - _stocker_sticky_last.get(channel.id, 0) < 3:
+        await asyncio.sleep(3)
+        if channel.last_message_id == int(info.get("sticky_message_id") or 0):
+            return
+    _stocker_sticky_busy.add(channel.id)
+    try:
+        old_id = info.get("sticky_message_id")
+        if old_id:
+            try:
+                old = channel.get_partial_message(int(old_id))
+                await old.delete()
+            except discord.HTTPException:
+                pass
+        msg = await channel.send(embed=stocker_embed(info["stocker_id"]), view=StockerStickyView(),
+                                 allowed_mentions=discord.AllowedMentions.none())
+        info["sticky_message_id"] = str(msg.id)
+        _stocker_sticky_last[channel.id] = time.time()
+        save_stockers()
+    except discord.HTTPException as e:
+        print(f"[STOCKER STICKY] {e}")
+    finally:
+        _stocker_sticky_busy.discard(channel.id)
+
+
+async def stocker_on_message(message):
+    if message.author.id == bot.user.id:
+        return
+    if str(message.channel.id) in _stockers["channels"]:
+        await refresh_stocker_sticky(message.channel)
+
+
+@bot.tree.command(name="stocker", description="Create a temporary stock channel for a member.")
+@app_commands.checks.has_permissions(manage_channels=True)
+@app_commands.describe(member="The stocker", days="How many days the channel will exist")
+async def stocker_cmd(interaction: discord.Interaction, member: discord.Member,
+                      days: app_commands.Range[int, 1, 365]):
+    guild = interaction.guild
+    if guild is None:
+        await safe_error(interaction, "❌ Use this command in a server.")
+        return
+    category = discord.utils.find(
+        lambda c: c.name.lower().strip() == STOCKER_CATEGORY_NAME, guild.categories)
+    if category is None:
+        await safe_error(interaction, f"❌ Create a category named **{STOCKER_CATEGORY_NAME}** first.")
+        return
+    await interaction.response.defer(ephemeral=True)
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True),
+        member: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, embed_links=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_messages=True),
+    }
+    name = f"{STOCKER_CHANNEL_PREFIX}{member.display_name.lower()} stock"[:95]
+    try:
+        channel = await guild.create_text_channel(name=name, category=category, overwrites=overwrites,
+                                                  topic=f"{member.display_name}'s stock • closes in {days} days")
+    except discord.HTTPException as e:
+        print(f"[STOCKER CREATE] {e}")
+        await interaction.followup.send("❌ I couldn't create the channel (missing Manage Channels permission?).", ephemeral=True)
+        return
+    delete_at = time.time() + days * 86400
+    _stockers["channels"][str(channel.id)] = {
+        "guild_id": str(guild.id),
+        "stocker_id": str(member.id),
+        "delete_at": delete_at,
+        "sticky_message_id": None,
+    }
+    save_stockers()
+    await refresh_stocker_sticky(channel)
+    await interaction.followup.send(
+        f"✅ Created {channel.mention} for {member.mention}. It will be deleted <t:{int(delete_at)}:R>.",
+        ephemeral=True,
+    )
+
+
+async def stocker_cleanup_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            now = time.time()
+            for ch_id, info in list(_stockers["channels"].items()):
+                if now < float(info.get("delete_at") or 0):
+                    continue
+                channel = bot.get_channel(int(ch_id))
+                if channel:
+                    try:
+                        await channel.delete(reason="Stocker channel expired")
+                    except discord.HTTPException as e:
+                        print(f"[STOCKER EXPIRE] {e}")
+                        continue
+                _stockers["channels"].pop(ch_id, None)
+                save_stockers()
+        except Exception as e:
+            print(f"[STOCKER LOOP] {e}")
+        await asyncio.sleep(300)
+
+
+def register_extra_views(client):
+    client.add_view(RateView())
+    client.add_view(StockerStickyView())
+    client.add_view(StockerNegotiationView())
+    client.loop.create_task(stocker_cleanup_loop())
+
+
 
 if __name__ == "__main__":
     print("============================================")
