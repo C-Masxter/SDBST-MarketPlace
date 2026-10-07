@@ -1,5 +1,6 @@
 import os
 import re
+from typing import Optional
 from datetime import datetime, timedelta, timezone
 
 import time
@@ -7371,13 +7372,16 @@ STOCKERS_FILE = Path("stockers.json")
 # If a role with the same name exists in the server, the bot gives it
 # (and removes the lower tier roles).
 RANK_TIERS = [
-    (0, "Bronze Client"),
-    (100, "Silver Client"),
-    (500, "Gold Client"),
-    (1000, "Platinum Client"),
-    (2500, "Diamond Client"),
-    (5000, "Elite Client"),
+    (200, "Bronze Client"),
+    (500, "Silver Client"),
+    (1000, "Gold Client"),
+    (2000, "Diamond Client"),
+    (5000, "Amethyst Client"),
+    (10000, "Whale Client"),
 ]
+
+# Old tier role names without a threshold anymore, still removed on rank-up.
+RANK_LEGACY_ROLES = ("Platinum Client", "Elite Client")
 
 STOCKER_CATEGORY_NAME = "stockers channel"
 STOCKER_CHANNEL_PREFIX = "🪎│"
@@ -7427,11 +7431,19 @@ def parse_amount(value):
 
 
 def rank_for_total(total):
-    current = RANK_TIERS[0][1]
+    current = None
     for threshold, name in RANK_TIERS:
         if total >= threshold:
             current = name
     return current
+
+
+def next_rank_for_total(total):
+    """(amount still needed, next rank name) - (0, None) at the top rank."""
+    for threshold, name in RANK_TIERS:
+        if total < threshold:
+            return threshold - total, name
+    return 0, None
 
 
 def fmt_money(value):
@@ -7443,16 +7455,22 @@ async def apply_rank_role(guild, member, total):
     """Give the matching rank role (if it exists) and remove the other tier roles."""
     if guild is None or member is None:
         return
-    wanted = rank_for_total(total).lower()
-    tier_names = {name.lower() for _, name in RANK_TIERS}
+    wanted = rank_for_total(total)
+    wanted_lower = wanted.lower() if wanted else None
+    tier_names = {name.lower() for _, name in RANK_TIERS} | {n.lower() for n in RANK_LEGACY_ROLES}
     to_add, to_remove = [], []
     for role in guild.roles:
-        name = role.name.lower()
-        if name not in tier_names:
+        name = role.name.lower().strip()
+        matched = None
+        for tier in tier_names:
+            if name == tier or tier in name or name in tier:
+                matched = tier
+                break
+        if matched is None:
             continue
-        if name == wanted and role not in member.roles:
+        if wanted_lower and matched == wanted_lower and role not in member.roles:
             to_add.append(role)
-        elif name != wanted and role in member.roles:
+        elif (not wanted_lower or matched != wanted_lower) and role in member.roles:
             to_remove.append(role)
     try:
         if to_remove:
@@ -7556,27 +7574,49 @@ async def send_rate_message(channel, guild, buyer_id, seller_id, amount):
 # ---------------- /profile and /vouchrank ----------------
 
 @bot.tree.command(name="profile", description="Show a member's trading profile.")
-@app_commands.describe(member="Member to look up (leave empty for yourself)")
-async def profile_cmd(interaction: discord.Interaction, member: discord.Member = None):
+@app_commands.describe(member="Member to look up (optional, defaults to you)")
+async def profile_cmd(interaction: discord.Interaction, member: Optional[discord.Member] = None):
     if interaction.guild is None:
         await safe_error(interaction, "❌ Use this command in a server.")
         return
     member = member or interaction.user
+    # First profile lookup after startup recounts the vouches channel history,
+    # so vouches posted before the bot started counting are never lost.
+    if str(interaction.guild.id) not in _vouch_scanned_guilds:
+        _vouch_scanned_guilds.add(str(interaction.guild.id))
+        try:
+            await scan_vouch_history(interaction.guild, limit=500)
+        except Exception as e:
+            print(f"[VOUCH SCAN] {e}")
     p = profile_for(interaction.guild.id, member.id)
+    # Self-heal rank roles in case the bot was offline when someone crossed a tier.
+    try:
+        await apply_rank_role(interaction.guild, member, float(p.get("deal_total") or 0))
+    except Exception as e:
+        print(f"[RANK ROLE] {e}")
     ratings = p.get("ratings") or []
-    rate = f"{sum(ratings) / len(ratings):.1f} ({len(ratings)} rating{'s' if len(ratings) != 1 else ''})" if ratings else "No ratings yet"
+    rate = f"{sum(ratings) / len(ratings):.1f} ({len(ratings)} rating{'s' if len(ratings) != 1 else ''})" if ratings else None
     total = float(p.get("deal_total") or 0)
     count = int(p.get("deal_count") or 0)
-    embed = discord.Embed(title=f"{member.display_name}'s profile", color=discord.Color.blurple())
+    vouches = int(p.get("vouches") or 0)
+    rank_name = rank_for_total(total) or "No rank yet"
+    next_needed, next_rank = next_rank_for_total(total)
+    if next_rank:
+        next_line = f"**Next rank:** {next_rank} in __**{fmt_money(next_needed)}**__ more deals"
+    else:
+        next_line = "**Next rank:** Top rank reached 🐋"
+    embed = discord.Embed(title=f"{member.display_name}'s profile", color=discord.Color.gold())
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.description = (
         f"{member.mention}\n"
         f"**Discord user id:** {member.id}\n"
-        f"**Deals done:** {fmt_money(total)} {count} deal{'s' if count != 1 else ''}\n"
-        f"**Rank:** {rank_for_total(total)}\n"
-        f"**Vouches in this server:** {int(p.get('vouches') or 0)} vouches\n"
-        f"**Rate from others:** {rate}"
+        f"**Deals done:** __**{fmt_money(total)}**__ __**{count}**__ deal{'s' if count != 1 else ''}\n"
+        f"**Rank:** {rank_name}\n"
+        f"{next_line}\n"
+        f"**Vouches in this server:** __**{vouches}**__ vouch{'es' if vouches != 1 else ''}\n"
+        + (f"**Rate from others:** __**{rate}**__" if rate else "**Rate from others:** No ratings yet")
     )
+    embed.set_footer(text=f"Stats counted in {interaction.guild.name} only")
     await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 
@@ -7628,15 +7668,98 @@ async def profile_edit_cmd(interaction: discord.Interaction, member: discord.Mem
                                             allowed_mentions=discord.AllowedMentions.none())
 
 
-def count_vouch_mentions(message):
+# Message ids already counted, per guild, so a rescan never counts the same
+# vouch twice. Persisted inside profiles.json.
+_vouch_seen = _profiles.setdefault("vouch_seen", {})
+_vouch_scanned_guilds = set()
+
+
+def _seen_vouch_ids(guild_id):
+    return set(_vouch_seen.setdefault(str(guild_id), []))
+
+
+def _register_vouch_message(guild_id, message_id):
+    ids = _vouch_seen.setdefault(str(guild_id), [])
+    ids.append(str(message_id))
+    if len(ids) > 2000:
+        _vouch_seen[str(guild_id)] = ids[-2000:]
+
+
+def count_vouch_mentions(message, save=True):
     """Every message in the vouches channel that mentions someone = +1 vouch for each person mentioned."""
+    if str(message.id) in _seen_vouch_ids(message.guild.id):
+        return
+    _register_vouch_message(message.guild.id, message.id)
+    mentioned = {u for u in message.mentions if not u.bot and u.id != message.author.id}
+    # Also catch plain user ids pasted as text (old vouch style) and the
+    # author of a replied-to message.
+    content_wo_tags = re.sub(r"<[#@&!]+\d+>", "", message.content or "")
+    for uid in set(re.findall(r"\b(\d{15,21})\b", content_wo_tags)):
+        m = message.guild.get_member(int(uid))
+        if m and not m.bot and int(uid) != message.author.id:
+            mentioned.add(m)
+    ref = getattr(message, "reference", None)
+    resolved = getattr(ref, "resolved", None) if ref else None
+    ref_author = getattr(resolved, "author", None)
+    if ref_author is not None and not ref_author.bot and ref_author.id != message.author.id:
+        mentioned.add(ref_author)
     changed = False
-    for user in {u for u in message.mentions if not u.bot and u.id != message.author.id}:
+    for user in mentioned:
         p = profile_for(message.guild.id, user.id)
         p["vouches"] = int(p.get("vouches") or 0) + 1
         changed = True
-    if changed:
+    if changed and save:
         save_profiles()
+
+
+async def scan_vouch_history(guild, limit=1000):
+    """Recount recent vouches-channel history so older vouches get counted too."""
+    config = await cached_config_safe(guild.id)
+    raw = config.get("vouches_channel_id")
+    try:
+        channel_id = int(raw) if raw else 0
+    except (TypeError, ValueError):
+        channel_id = 0
+    if not channel_id:
+        return None
+    channel = guild.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await guild.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return None
+    if not isinstance(channel, discord.TextChannel):
+        return None
+    counted = 0
+    try:
+        async for message in channel.history(limit=limit):
+            before = len(_seen_vouch_ids(guild.id))
+            count_vouch_mentions(message, save=False)
+            if len(_seen_vouch_ids(guild.id)) > before:
+                counted += 1
+    except discord.HTTPException as e:
+        print(f"[VOUCH SCAN HISTORY] {e}")
+        return None
+    save_profiles()
+    return counted
+
+
+@bot.tree.command(name="vouchsync", description="(Admin) Recount vouches from the vouches channel history.")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(limit="How many recent messages to scan (max 1000)")
+async def vouchsync_cmd(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 1000] = 500):
+    if interaction.guild is None:
+        await safe_error(interaction, "❌ Use this command in a server.")
+        return
+    await interaction.response.defer(ephemeral=True)
+    counted = await scan_vouch_history(interaction.guild, limit=limit)
+    if counted is None:
+        await interaction.followup.send("❌ No vouches channel is configured. Set it in `/setup` → Vouch Settings.", ephemeral=True)
+        return
+    await interaction.followup.send(
+        f"✅ Scanned the last {limit} messages in the vouches channel — counted {counted} vouch{'es' if counted != 1 else ''}.",
+        ephemeral=True,
+    )
 
 
 # ---------------- /stocker channels ----------------
@@ -7645,7 +7768,8 @@ def stocker_embed(stocker_id):
     return discord.Embed(
         description=(
             f"📌 This channel is for <@{stocker_id}> stock.\n"
-            f"If you want to buy skins or negotiate with him, click the button below."
+            f"If you want to buy skins or negotiate with him, click the button below.\n"
+            f"When you're ready for a middleman, use the ➡️ **Request MM** button."
         ),
         color=discord.Color.green(),
     )
@@ -7704,7 +7828,7 @@ class StockerBuyButton(discord.ui.Button):
             title="🛒 Stock negotiation opened",
             description=(
                 f"**Buyer:** {buyer.mention}\n**Stocker:** {stocker.mention}\n\n"
-                f"💬 Negotiate the deal privately here. Use `/mm` when you're ready for a middleman."
+                f"💬 Negotiate the deal privately here. When you're ready for a middleman, use the ➡️ **Request MM** button."
             ),
             color=discord.Color.green(),
         )
@@ -7741,9 +7865,37 @@ class StockerCloseButton(discord.ui.Button):
             print(f"[STOCKER CLOSE] {e}")
 
 
+class StockerMMPanelButton(discord.ui.Button):
+    """Arrow that leads members to the MM panel (same as the negotiation ticket)."""
+
+    def __init__(self):
+        super().__init__(label="Request MM", emoji="➡️", style=discord.ButtonStyle.primary, custom_id="sdbst:stocker:mm")
+
+    async def callback(self, interaction: discord.Interaction):
+        config = await cached_config_safe(interaction.guild.id)
+        panel_msg = config.get("mm_panel_message_id") or _bot_config.get(str(interaction.guild.id), {}).get("mm_panel_message_id")
+        channel_id = config.get("mm_panel_channel_id") or config.get("mm_channel_id")
+        link = None
+        if panel_msg and channel_id:
+            link = f"https://discord.com/channels/{interaction.guild.id}/{channel_id}/{panel_msg}"
+        elif channel_id:
+            link = f"https://discord.com/channels/{interaction.guild.id}/{channel_id}"
+        if link:
+            await interaction.response.send_message(
+                f"➡️ Open the MM panel and request a middleman there: {link}",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "❌ No MM panel is set up yet — an admin can post one from `/setup` → MM Panel.",
+                ephemeral=True,
+            )
+
+
 class StockerNegotiationView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
+        self.add_item(StockerMMPanelButton())
         self.add_item(StockerCloseButton())
 
 
