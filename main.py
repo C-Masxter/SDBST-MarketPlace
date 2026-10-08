@@ -7616,7 +7616,6 @@ async def profile_cmd(interaction: discord.Interaction, member: Optional[discord
         f"**Vouches in this server:** __**{vouches}**__ vouch{'es' if vouches != 1 else ''}\n"
         + (f"**Rate from others:** __**{rate}**__" if rate else "**Rate from others:** No ratings yet")
     )
-    embed.set_footer(text=f"Stats counted in {interaction.guild.name} only")
     await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 
@@ -7746,8 +7745,8 @@ async def scan_vouch_history(guild, limit=1000):
 
 @bot.tree.command(name="vouchsync", description="(Admin) Recount vouches from the vouches channel history.")
 @app_commands.checks.has_permissions(administrator=True)
-@app_commands.describe(limit="How many recent messages to scan (max 1000)")
-async def vouchsync_cmd(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 1000] = 500):
+@app_commands.describe(limit="How many recent messages to scan (max 2000)")
+async def vouchsync_cmd(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 2000] = 500):
     if interaction.guild is None:
         await safe_error(interaction, "❌ Use this command in a server.")
         return
@@ -7768,8 +7767,7 @@ def stocker_embed(stocker_id):
     return discord.Embed(
         description=(
             f"📌 This channel is for <@{stocker_id}> stock.\n"
-            f"If you want to buy skins or negotiate with him, click the button below.\n"
-            f"When you're ready for a middleman, use the ➡️ **Request MM** button."
+            f"If you want to buy skins or negotiate with him, click the button below."
         ),
         color=discord.Color.green(),
     )
@@ -7935,6 +7933,28 @@ async def refresh_stocker_sticky(channel):
 async def stocker_on_message(message):
     if message.author.id == bot.user.id:
         return
+
+    # In private stocker deal channels, notify the other participant when
+    # either side sends a message, matching the regular trade-ticket flow.
+    if message.guild is not None:
+        negotiation = _stockers["negotiations"].get(str(message.channel.id))
+        if negotiation:
+            author_id = str(message.author.id)
+            buyer_id = str(negotiation.get("buyer_id"))
+            stocker_id = str(negotiation.get("stocker_id"))
+            if author_id == buyer_id:
+                recipient_id = stocker_id
+            elif author_id == stocker_id:
+                recipient_id = buyer_id
+            else:
+                recipient_id = None
+            if recipient_id and recipient_id != "None":
+                await temporary_mm_ping(
+                    message.channel,
+                    f"<@{recipient_id}>\nYou’ve received a response on your trade.",
+                    delay=3.0,
+                )
+
     if str(message.channel.id) in _stockers["channels"]:
         await refresh_stocker_sticky(message.channel)
 
