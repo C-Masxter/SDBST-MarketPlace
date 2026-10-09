@@ -1165,7 +1165,10 @@ class SDBSTBot(commands.Bot):
 
         super().__init__(
             command_prefix="!",
-            intents=intents
+            intents=intents,
+            # Cap discord.py's in-memory message cache (default 1000).
+            # Nothing in this bot reads cached messages.
+            max_messages=300,
         )
 
         self.views_restored = False
@@ -1310,6 +1313,9 @@ class SDBSTBot(commands.Bot):
             global _inactivity_task
             if _inactivity_task is None or _inactivity_task.done():
                 _inactivity_task = asyncio.create_task(inactivity_monitor())
+            global _vouch_scan_task
+            if _vouch_scan_task is None or _vouch_scan_task.done():
+                _vouch_scan_task = asyncio.create_task(vouch_scan_loop())
 
 
     async def close(self):
@@ -6658,7 +6664,8 @@ async def on_message(message):
     if not message.author.bot and config.get("vouches_channel_id"):
         try:
             if message.channel.id == int(config["vouches_channel_id"]):
-                count_vouch_mentions(message)
+                if count_vouch_mentions(message):
+                    asyncio.create_task(sync_vouch_top_roles(message.guild))
                 text = (message.content or "").lower()
                 if "vouch" in text:
                     changed = False
@@ -7451,6 +7458,20 @@ def fmt_money(value):
     return f"${int(value):,}" if value == int(value) else f"${value:,.2f}"
 
 
+def find_role_by_name(guild, name):
+    wanted = name.lower().strip()
+    for role in guild.roles:
+        if role.name.lower().strip() == wanted:
+            return role
+    return None
+
+
+def rank_label(guild, rank_name):
+    """Role mention (shows the role colour) when the server has that role, else plain text."""
+    role = find_role_by_name(guild, rank_name) if guild is not None else None
+    return role.mention if role else rank_name
+
+
 async def apply_rank_role(guild, member, total):
     """Give the matching rank role (if it exists) and remove the other tier roles."""
     if guild is None or member is None:
@@ -7599,10 +7620,12 @@ async def profile_cmd(interaction: discord.Interaction, member: Optional[discord
     total = float(p.get("deal_total") or 0)
     count = int(p.get("deal_count") or 0)
     vouches = int(p.get("vouches") or 0)
-    rank_name = rank_for_total(total) or "No rank yet"
+    recent_vouches = recent_vouch_counts(interaction.guild.id).get(str(member.id), 0)
+    current_rank = rank_for_total(total)
+    rank_text = rank_label(interaction.guild, current_rank) if current_rank else "No rank yet"
     next_needed, next_rank = next_rank_for_total(total)
     if next_rank:
-        next_line = f"**Next rank:** {next_rank} in __**{fmt_money(next_needed)}**__ more deals"
+        next_line = f"**Next rank:** {rank_label(interaction.guild, next_rank)} in __**{fmt_money(next_needed)}**__ more deals"
     else:
         next_line = "**Next rank:** Top rank reached 🐋"
     embed = discord.Embed(title=f"{member.display_name}'s profile", color=discord.Color.gold())
@@ -7611,28 +7634,26 @@ async def profile_cmd(interaction: discord.Interaction, member: Optional[discord
         f"{member.mention}\n"
         f"**Discord user id:** {member.id}\n"
         f"**Deals done:** __**{fmt_money(total)}**__ __**{count}**__ deal{'s' if count != 1 else ''}\n"
-        f"**Rank:** {rank_name}\n"
+        f"**Rank:** {rank_text}\n"
         f"{next_line}\n"
         f"**Vouches in this server:** __**{vouches}**__ vouch{'es' if vouches != 1 else ''}\n"
+        f"**Vouches in latest {RECENT_VOUCH_WINDOW}:** __**{recent_vouches}**__\n"
         + (f"**Rate from others:** __**{rate}**__" if rate else "**Rate from others:** No ratings yet")
     )
     await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 
-@bot.tree.command(name="vouchrank", description="Top 20 members with the most vouches in this server.")
+@bot.tree.command(name="vouchrank", description="Top 30 members with the most vouches in this server.")
 async def vouchrank_cmd(interaction: discord.Interaction):
     if interaction.guild is None:
         await safe_error(interaction, "❌ Use this command in a server.")
         return
     await interaction.response.defer()
-    guild_data = _profiles["guilds"].get(str(interaction.guild.id), {})
-    ranked = sorted(
-        ((uid, int(d.get("vouches") or 0)) for uid, d in guild_data.items() if int(d.get("vouches") or 0) > 0),
-        key=lambda x: -x[1],
-    )[:20]
+    ranked = _vouch_ranking(interaction.guild.id)
     if not ranked:
         await interaction.followup.send("📊 No vouches recorded yet.")
         return
+    recent = recent_vouch_counts(interaction.guild.id)
     lines = []
     for i, (uid, total) in enumerate(ranked, start=1):
         member = interaction.guild.get_member(int(uid))
@@ -7642,11 +7663,17 @@ async def vouchrank_cmd(interaction: discord.Interaction):
             except discord.HTTPException:
                 member = None
         name = member.display_name if member else f"User {uid}"
-        lines.append(f"{i}. __**{name}**__ has **{total}** vouch{'es' if total != 1 else ''}")
-    await interaction.followup.send(
-        "🏆 **Vouch rankings — Top 20**\n\n" + "\n".join(lines),
-        allowed_mentions=discord.AllowedMentions.none(),
+        lines.append(
+            f"{i}. __**{name}**__ has **{total}** vouch{'es' if total != 1 else ''}"
+            f" · **{recent.get(uid, 0)}** in latest {RECENT_VOUCH_WINDOW}"
+        )
+    embed = discord.Embed(
+        title=f"🏆 Vouch rankings — Top {VOUCH_LEADERBOARD_SIZE}",
+        description="\n".join(lines)[:4000],
+        color=discord.Color.gold(),
     )
+    embed.set_footer(text=f"Total vouches · vouches in the latest {RECENT_VOUCH_WINDOW} shown per member")
+    await interaction.followup.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.tree.command(name="profile_edit", description="(Admin) Change a member's profile numbers.")
@@ -7668,26 +7695,70 @@ async def profile_edit_cmd(interaction: discord.Interaction, member: discord.Mem
 
 
 # Message ids already counted, per guild, so a rescan never counts the same
-# vouch twice. Persisted inside profiles.json.
+# vouch twice. Persisted inside profiles.json (newest 2000 kept).
 _vouch_seen = _profiles.setdefault("vouch_seen", {})
+_vouch_seen_sets = {}
 _vouch_scanned_guilds = set()
+
+# Latest vouch messages with the users they vouched for (newest 2000 per guild).
+# Powers the "latest 2000 vouches" stat on /profile and /vouchrank.
+RECENT_VOUCH_WINDOW = 2000
+_vouch_recent = _profiles.setdefault("vouch_recent", {})
+
+# Vouch leaderboard roles: top 10 get Ultra Trusted, places 11-30 get Trusted.
+VOUCH_LEADERBOARD_SIZE = 30
+VOUCH_TOP_ROLES = (
+    (10, "Ultra Trusted"),
+    (VOUCH_LEADERBOARD_SIZE, "Trusted"),
+)
+
+# Automatic re-scan of the vouches channel. 60 * 60 = hourly, 2 * 60 * 60 = every two hours.
+VOUCH_SCAN_INTERVAL_SECONDS = 60 * 60
+VOUCH_SCAN_LIMIT = 2000
+_vouch_scan_task = None
 
 
 def _seen_vouch_ids(guild_id):
-    return set(_vouch_seen.setdefault(str(guild_id), []))
+    key = str(guild_id)
+    if key not in _vouch_seen_sets:
+        _vouch_seen_sets[key] = set(_vouch_seen.get(key, []))
+    return _vouch_seen_sets[key]
 
 
 def _register_vouch_message(guild_id, message_id):
-    ids = _vouch_seen.setdefault(str(guild_id), [])
+    key = str(guild_id)
+    ids = _vouch_seen.setdefault(key, [])
     ids.append(str(message_id))
     if len(ids) > 2000:
-        _vouch_seen[str(guild_id)] = ids[-2000:]
+        del ids[:-2000]
+        _vouch_seen_sets.pop(key, None)  # rebuilt on next use
+    else:
+        _seen_vouch_ids(key).add(str(message_id))
+
+
+def _record_recent_vouch(guild_id, message_id, user_ids):
+    key = str(guild_id)
+    entries = _vouch_recent.setdefault(key, [])
+    entries.append([str(message_id), [str(u) for u in user_ids]])
+    if len(entries) > RECENT_VOUCH_WINDOW:
+        entries.sort(key=lambda e: int(e[0]))  # snowflakes sort by time
+        del entries[:-RECENT_VOUCH_WINDOW]
+
+
+def recent_vouch_counts(guild_id):
+    """user id -> vouches among the latest RECENT_VOUCH_WINDOW vouch messages."""
+    counts = {}
+    for _, user_ids in _vouch_recent.get(str(guild_id), []):
+        for uid in user_ids:
+            counts[uid] = counts.get(uid, 0) + 1
+    return counts
 
 
 def count_vouch_mentions(message, save=True):
-    """Every message in the vouches channel that mentions someone = +1 vouch for each person mentioned."""
+    """Every message in the vouches channel that mentions someone = +1 vouch for each person mentioned.
+    Returns True when this message added vouches."""
     if str(message.id) in _seen_vouch_ids(message.guild.id):
-        return
+        return False
     _register_vouch_message(message.guild.id, message.id)
     mentioned = {u for u in message.mentions if not u.bot and u.id != message.author.id}
     # Also catch plain user ids pasted as text (old vouch style) and the
@@ -7702,17 +7773,20 @@ def count_vouch_mentions(message, save=True):
     ref_author = getattr(resolved, "author", None)
     if ref_author is not None and not ref_author.bot and ref_author.id != message.author.id:
         mentioned.add(ref_author)
-    changed = False
+    if not mentioned:
+        return False
     for user in mentioned:
         p = profile_for(message.guild.id, user.id)
         p["vouches"] = int(p.get("vouches") or 0) + 1
-        changed = True
-    if changed and save:
+    _record_recent_vouch(message.guild.id, message.id, [u.id for u in mentioned])
+    if save:
         save_profiles()
+    return True
 
 
 async def scan_vouch_history(guild, limit=1000):
-    """Recount recent vouches-channel history so older vouches get counted too."""
+    """Recount recent vouches-channel history so older vouches get counted too.
+    Messages are streamed and not kept in memory; only the counted ids are stored."""
     config = await cached_config_safe(guild.id)
     raw = config.get("vouches_channel_id")
     try:
@@ -7732,15 +7806,75 @@ async def scan_vouch_history(guild, limit=1000):
     counted = 0
     try:
         async for message in channel.history(limit=limit):
-            before = len(_seen_vouch_ids(guild.id))
-            count_vouch_mentions(message, save=False)
-            if len(_seen_vouch_ids(guild.id)) > before:
+            if count_vouch_mentions(message, save=False):
                 counted += 1
     except discord.HTTPException as e:
         print(f"[VOUCH SCAN HISTORY] {e}")
-        return None
+        counted = None
     save_profiles()
     return counted
+
+
+def _vouch_ranking(guild_id):
+    """[(user id, vouches)] for the top VOUCH_LEADERBOARD_SIZE, ties broken by id."""
+    guild_data = _profiles["guilds"].get(str(guild_id), {})
+    return sorted(
+        ((uid, int(d.get("vouches") or 0)) for uid, d in guild_data.items() if int(d.get("vouches") or 0) > 0),
+        key=lambda x: (-x[1], int(x[0])),
+    )[:VOUCH_LEADERBOARD_SIZE]
+
+
+async def sync_vouch_top_roles(guild):
+    """Ultra Trusted for leaderboard places 1-10, Trusted for places 11-30."""
+    if guild is None:
+        return
+    roles = {name: find_role_by_name(guild, name) for _, name in VOUCH_TOP_ROLES}
+    if not any(roles.values()):
+        return
+    wanted = {}
+    for position, (uid, _) in enumerate(_vouch_ranking(guild.id), start=1):
+        for size, role_name in VOUCH_TOP_ROLES:
+            if position <= size:
+                wanted[uid] = role_name
+                break
+    for role_name, role in roles.items():
+        if role is None:
+            continue
+        keep = {uid for uid, name in wanted.items() if name == role_name}
+        for member in list(role.members):
+            if str(member.id) not in keep:
+                try:
+                    await member.remove_roles(role, reason="Vouch leaderboard update")
+                except discord.HTTPException as e:
+                    print(f"[VOUCH ROLE REMOVE] {e}")
+        for uid in keep:
+            member = guild.get_member(int(uid))
+            if member is None:
+                try:
+                    member = await guild.fetch_member(int(uid))
+                except discord.HTTPException:
+                    continue
+            if role not in member.roles:
+                try:
+                    await member.add_roles(role, reason="Vouch leaderboard update")
+                except discord.HTTPException as e:
+                    print(f"[VOUCH ROLE ADD] {e}")
+
+
+async def vouch_scan_loop():
+    """Re-scan each guild's vouches channel on a timer, then refresh the leaderboard roles."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        for guild in list(bot.guilds):
+            try:
+                counted = await scan_vouch_history(guild, limit=VOUCH_SCAN_LIMIT)
+                if counted:
+                    print(f"[VOUCH AUTO SCAN] {guild.id}: counted {counted} new vouch(es)")
+                await sync_vouch_top_roles(guild)
+            except Exception as e:
+                print(f"[VOUCH AUTO SCAN] {guild.id}: {e}")
+            await asyncio.sleep(10)
+        await asyncio.sleep(VOUCH_SCAN_INTERVAL_SECONDS)
 
 
 @bot.tree.command(name="vouchsync", description="(Admin) Recount vouches from the vouches channel history.")
@@ -7752,6 +7886,7 @@ async def vouchsync_cmd(interaction: discord.Interaction, limit: app_commands.Ra
         return
     await interaction.response.defer(ephemeral=True)
     counted = await scan_vouch_history(interaction.guild, limit=limit)
+    await sync_vouch_top_roles(interaction.guild)
     if counted is None:
         await interaction.followup.send("❌ No vouches channel is configured. Set it in `/setup` → Vouch Settings.", ephemeral=True)
         return
