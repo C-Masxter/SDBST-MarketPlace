@@ -7381,6 +7381,7 @@ STOCKERS_FILE = Path("stockers.json")
 # If a role with the same name exists in the server, the bot gives it
 # (and removes the lower tier roles).
 RANK_TIERS = [
+    (1, "Client"),
     (200, "Bronze Client"),
     (500, "Silver Client"),
     (1000, "Gold Client"),
@@ -7474,6 +7475,11 @@ def find_role_by_name(guild, name):
         # Prevent 'trusted' query from matching 'ultra trusted'
         if w == "trusted" and "ultra" in r:
             return True
+        # Prevent 'client' query from matching higher tiered client roles
+        if w == "client":
+            other_tiers = ("bronze", "silver", "gold", "diamond", "amethyst", "whale", "platinum", "elite")
+            if any(t in r for t in other_tiers):
+                return True
         return False
 
     # 2. Role starts with wanted name (e.g. "Bronze Client [$200+ deal done]", "Ultra Trusted [Top 10]")
@@ -7517,12 +7523,18 @@ async def apply_rank_role(guild, member, total):
         return
     wanted = rank_for_total(total)
     wanted_lower = wanted.lower() if wanted else None
-    tier_names = {name.lower() for _, name in RANK_TIERS} | {n.lower() for n in RANK_LEGACY_ROLES}
+    tier_names = [name.lower() for _, name in RANK_TIERS] + [n.lower() for n in RANK_LEGACY_ROLES]
+    # Sort longest first so "bronze client" matches before "client"
+    tier_names_sorted = sorted(tier_names, key=len, reverse=True)
     to_add, to_remove = [], []
     for role in guild.roles:
         name = role.name.lower().strip()
         matched = None
-        for tier in tier_names:
+        for tier in tier_names_sorted:
+            if tier == "client":
+                other_tiers = ("bronze", "silver", "gold", "diamond", "amethyst", "whale", "platinum", "elite")
+                if any(t in name for t in other_tiers):
+                    continue
             if name == tier or tier in name or name in tier:
                 matched = tier
                 break
@@ -7684,7 +7696,7 @@ async def profile_cmd(interaction: discord.Interaction, member: Optional[discord
     await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 
-@bot.tree.command(name="vouchrank", description="Top 30 members with the most vouches in this server.")
+@bot.tree.command(name="vouchrank", description="Top 35 members with the most vouches in this server.")
 async def vouchrank_cmd(interaction: discord.Interaction):
     if interaction.guild is None:
         await safe_error(interaction, "❌ Use this command in a server.")
@@ -7749,10 +7761,10 @@ _vouch_scanned_guilds = set()
 RECENT_VOUCH_WINDOW = 2000
 _vouch_recent = _profiles.setdefault("vouch_recent", {})
 
-# Vouch leaderboard roles: top 10 get Ultra Trusted, places 11-30 get Trusted.
-VOUCH_LEADERBOARD_SIZE = 30
+# Vouch leaderboard roles: top 15 get Ultra Trusted, places 16-35 get Trusted.
+VOUCH_LEADERBOARD_SIZE = 35
 VOUCH_TOP_ROLES = (
-    (10, "Ultra Trusted"),
+    (15, "Ultra Trusted"),
     (VOUCH_LEADERBOARD_SIZE, "Trusted"),
 )
 
@@ -7805,9 +7817,15 @@ def recent_vouch_counts(guild_id):
 def count_vouch_mentions(message, save=True):
     """Every message in the vouches channel that mentions someone = +1 vouch for each person mentioned.
     Returns True when this message added vouches."""
+    if message.author.bot or getattr(message, "webhook_id", None):
+        return False
     if str(message.id) in _seen_vouch_ids(message.guild.id):
         return False
     _register_vouch_message(message.guild.id, message.id)
+    text = (message.content or "").lower()
+    negative_words = ("scam", "scammer", "fake", "stolen", "impersonator", "impersonating", "beware", "warn", "warning")
+    if any(nw in text for nw in negative_words):
+        return False
     mentioned = {u for u in message.mentions if not u.bot and u.id != message.author.id}
     # Also catch plain user ids pasted as text (old vouch style) and the
     # author of a replied-to message.
@@ -7864,6 +7882,8 @@ async def scan_vouch_history(guild, limit=1000, reset=False):
     counted = 0
     try:
         async for message in channel.history(limit=limit):
+            if message.author.bot or getattr(message, "webhook_id", None):
+                continue
             if count_vouch_mentions(message, save=False):
                 counted += 1
     except discord.HTTPException as e:
@@ -7883,7 +7903,7 @@ def _vouch_ranking(guild_id):
 
 
 async def sync_vouch_top_roles(guild):
-    """Ultra Trusted for leaderboard places 1-10, Trusted for places 11-30."""
+    """Ultra Trusted for leaderboard places 1-15, Trusted for places 16-35."""
     if guild is None:
         return
     roles = {name: find_role_by_name(guild, name) for _, name in VOUCH_TOP_ROLES}
@@ -7946,7 +7966,7 @@ async def vouch_scan_loop():
     limit="How many recent messages to scan (max 2000)",
     recount="If True, resets and recounts vouches cleanly from history to fix duplicates"
 )
-async def vouchsync_cmd(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 2000] = 500, recount: bool = False):
+async def vouchsync_cmd(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 10000] = 1000, recount: bool = False):
     if interaction.guild is None:
         await safe_error(interaction, "❌ Use this command in a server.")
         return
