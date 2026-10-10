@@ -7669,7 +7669,7 @@ async def profile_cmd(interaction: discord.Interaction, member: Optional[discord
         next_line = "**Next rank:** Top rank reached 🐋"
     embed = discord.Embed(title=f"{member.display_name}'s profile", color=discord.Color.gold())
     embed.set_thumbnail(url=member.display_avatar.url)
-    guild_label = interaction.guild.name if interaction.guild and interaction.guild.id != MAIN_GUILD_ID and "sniper" not in interaction.guild.name.lower() else "sniper duels buy sell and trade"
+    guild_label = interaction.guild.name if interaction.guild and interaction.guild.id != MAIN_GUILD_ID and "sniper" not in interaction.guild.name.lower() else "SNIPER DUELS Buy Sell & Trade"
     embed.description = (
         f"{member.mention}\n"
         f"**Discord user id:** {member.id}\n"
