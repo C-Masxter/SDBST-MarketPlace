@@ -7466,11 +7466,6 @@ def find_role_by_name(guild, name):
         return None
     wanted = name.lower().strip()
 
-    # 1. Exact match (case-insensitive)
-    for role in guild.roles:
-        if role.name.lower().strip() == wanted:
-            return role
-
     def is_conflict(w, r):
         # Prevent 'trusted' query from matching 'ultra trusted'
         if w == "trusted" and "ultra" in r:
@@ -7482,33 +7477,44 @@ def find_role_by_name(guild, name):
                 return True
         return False
 
-    # 2. Role starts with wanted name (e.g. "Bronze Client [$200+ deal done]", "Ultra Trusted [Top 10]")
+    candidates = []
     for role in guild.roles:
         rname = role.name.lower().strip()
         if is_conflict(wanted, rname):
             continue
-        if rname.startswith(wanted):
-            return role
 
-    # 3. Substring match
-    for role in guild.roles:
-        rname = role.name.lower().strip()
-        if is_conflict(wanted, rname):
-            continue
-        if wanted in rname:
-            return role
+        has_color = (getattr(role.color, "value", 0) != 0)
+        has_deal_tag = any(k in rname for k in ("deal", "[$", "[", "+", "$"))
 
-    # 4. All words match (e.g. "bronze" and "client" both in role name)
-    words = wanted.split()
-    if len(words) > 1:
-        for role in guild.roles:
-            rname = role.name.lower().strip()
-            if is_conflict(wanted, rname):
+        score = 0
+        if rname == wanted:
+            score = 100
+        elif rname.startswith(wanted):
+            score = 80
+        elif wanted in rname:
+            score = 60
+        else:
+            words = wanted.split()
+            if len(words) > 1 and all(w in rname for w in words):
+                score = 40
+            else:
                 continue
-            if all(w in rname for w in words):
-                return role
 
-    return None
+        # Strongly prioritize roles with custom colors so the role mention shows in its color!
+        if has_color:
+            score += 70
+        # Prioritize roles with tier brackets like [$1+ deal done]
+        if has_deal_tag:
+            score += 35
+
+        candidates.append((score, role.position, role))
+
+    if not candidates:
+        return None
+
+    # Pick the best scoring match (colored tier roles beat plain uncolored roles)
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return candidates[0][2]
 
 
 def rank_label(guild, rank_name):
