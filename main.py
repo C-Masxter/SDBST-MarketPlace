@@ -650,6 +650,27 @@ def extract_price_from_text(text):
         return f"${match.group(1)}"
 
 
+def parse_routing_amount(text):
+    """Read the dollar amount used for MM routing, including comma-formatted values."""
+    if not text:
+        return 0
+    # Prefer an explicitly marked currency amount over numbers in an item name
+    # (for example, "2K Robux, $1,305").
+    explicit_price = extract_price_from_text(text)
+    if explicit_price:
+        try:
+            return int(float(str(explicit_price).replace("$", "").replace(",", "")))
+        except (TypeError, ValueError):
+            pass
+    match = re.search(r"(?<!\d)(\d[\d,]*(?:\.\d+)?)", str(text))
+    if not match:
+        return 0
+    try:
+        return int(float(match.group(1).replace(",", "")))
+    except (TypeError, ValueError):
+        return 0
+
+
 async def resolve_ticket_item_price(channel, ticket):
     """Item/price for a negotiation ticket: record -> channel topic -> ad lookup."""
     ticket = ticket or {}
@@ -4992,19 +5013,22 @@ async def vouch_ticket(interaction: discord.Interaction):
         return
     mm_id = str(deal.get("claimed_by") or interaction.user.id)
     mm_mention = f"<@{mm_id}>"
-    amount = deal.get("price") or "the deal amount"
-    await interaction.followup.send(
-        f"{buyer_mention} {seller_mention}\nThis middleman ticket has been completed.\n"
-        f"Please leave a vouch for {mm_mention} in {vouch_channel.mention}.\n\n"
-        f"Sample vouch format: `Vouch mm {mm_mention} {amount} deal fast and easy`",
-        allowed_mentions=discord.AllowedMentions(users=True),
-    )
+    deal_amount = completed_deal_amount(deal)
+    amount_display = fmt_money(deal_amount) if deal_amount > 0 else "not available"
     try:
         deal_amount = await record_completed_deal(interaction.guild, deal, [buyer_id, seller_id])
+        amount_display = fmt_money(deal_amount) if deal_amount > 0 else "not available"
         save_mm_deals(_mm_deals)
         await send_rate_message(interaction.channel, interaction.guild, buyer_id, seller_id, deal_amount)
     except Exception as e:
         print(f"[PROFILE/RATE] {e}")
+    await interaction.followup.send(
+        f"{buyer_mention} {seller_mention}\nThis middleman ticket has been completed.\n"
+        f"**Deal value recorded:** {amount_display}\n"
+        f"Please leave a vouch for {mm_mention} in {vouch_channel.mention}.\n\n"
+        f"Sample vouch format: `Vouch mm {mm_mention} {amount_display} deal fast and easy`",
+        allowed_mentions=discord.AllowedMentions(users=True),
+    )
     timeout = int(config.get("vouch_timeout_seconds") or 86400)
     _vouch_state[deal_id] = {
         "deadline": time.time() + timeout,
@@ -5425,11 +5449,8 @@ class USDValueModal(discord.ui.Modal):
         await interaction.response.defer(ephemeral=True)
         try:
             raw = self.value_input.value.strip()
-            match = re.search(r"(?<!\d)(\d+(?:\.\d+)?)", raw)
-            if not match:
-                raise ValueError
-            value = int(float(match.group(1)))
-            if value < 0:
+            value = parse_routing_amount(raw)
+            if value <= 0:
                 raise ValueError
         except ValueError:
             await interaction.followup.send("❌ Include a dollar value, such as `$105.00, 2K Robux`.", ephemeral=True)
@@ -5701,12 +5722,12 @@ class MMConfirmButton(discord.ui.Button):
             participants = [str(uid) for uid in deal.get("participants", [])]
             if participants and all(confirmed.get(uid, False) for uid in participants):
                 raw = str(deal.get("price") or "")
-                match = re.search(r"(?<!\d)(\d+(?:\.\d+)?)", raw)
-                if not match:
+                routing_value = parse_routing_amount(raw)
+                if routing_value <= 0:
                     await interaction.message.edit(embed=mm_deal_embed(deal), view=DealConfirmView(self.deal_id))
-                    await interaction.followup.send("❌ Add an integer deal value before confirming so MM routing can be selected.", ephemeral=True)
+                    await interaction.followup.send("❌ Add a positive deal value before confirming so MM routing can be selected.", ephemeral=True)
                     return
-                deal["usd_routing_value"] = int(float(match.group(1)))
+                deal["usd_routing_value"] = routing_value
                 deal["state"] = "routing_mm"
                 save_mm_deals(_mm_deals)
                 await interaction.message.edit(embed=mm_deal_embed(deal), view=None)
@@ -7517,10 +7538,56 @@ def find_role_by_name(guild, name):
     return candidates[0][2]
 
 
+def _rank_tier_name_for_role(role_name):
+    """Match only a configured rank name, optionally followed by a label suffix.
+
+    This deliberately does not match a generic word inside another role name:
+    e.g. "Mythic Client" is not the base "Client" rank.
+    """
+    normalized = " ".join(str(role_name or "").casefold().split())
+    tier_names = sorted(
+        [name.casefold() for _, name in RANK_TIERS]
+        + [name.casefold() for name in RANK_LEGACY_ROLES],
+        key=len,
+        reverse=True,
+    )
+    suffix_boundaries = " [({|•—-"
+    for tier_name in tier_names:
+        if normalized == tier_name:
+            return tier_name
+        if normalized.startswith(tier_name):
+            suffix = normalized[len(tier_name):]
+            if suffix and suffix[0] in suffix_boundaries:
+                return tier_name
+    return None
+
+
+def find_rank_role_by_name(guild, rank_name):
+    """Find a role named for this exact rank, allowing a descriptive suffix."""
+    if guild is None or not rank_name:
+        return None
+    wanted = " ".join(str(rank_name).casefold().split())
+    matches = [
+        role for role in guild.roles
+        if _rank_tier_name_for_role(role.name) == wanted
+    ]
+    if not matches:
+        return None
+    # Prefer an exact configured name, then the highest-position matching role.
+    matches.sort(
+        key=lambda role: (
+            " ".join(role.name.casefold().split()) == wanted,
+            role.position,
+        ),
+        reverse=True,
+    )
+    return matches[0]
+
+
 def rank_label(guild, rank_name):
-    """Role mention (shows the role colour) when the server has that role, else plain text."""
-    role = find_role_by_name(guild, rank_name) if guild is not None else None
-    return role.mention if role else rank_name
+    """Return readable rank text; role mentions show as raw IDs in embed titles."""
+    role = find_rank_role_by_name(guild, rank_name) if guild is not None else None
+    return role.name if role else rank_name
 
 
 async def apply_rank_role(guild, member, total):
@@ -7529,21 +7596,9 @@ async def apply_rank_role(guild, member, total):
         return
     wanted = rank_for_total(total)
     wanted_lower = wanted.lower() if wanted else None
-    tier_names = [name.lower() for _, name in RANK_TIERS] + [n.lower() for n in RANK_LEGACY_ROLES]
-    # Sort longest first so "bronze client" matches before "client"
-    tier_names_sorted = sorted(tier_names, key=len, reverse=True)
     to_add, to_remove = [], []
     for role in guild.roles:
-        name = role.name.lower().strip()
-        matched = None
-        for tier in tier_names_sorted:
-            if tier == "client":
-                other_tiers = ("bronze", "silver", "gold", "diamond", "amethyst", "whale", "platinum", "elite")
-                if any(t in name for t in other_tiers):
-                    continue
-            if name == tier or tier in name or name in tier:
-                matched = tier
-                break
+        matched = _rank_tier_name_for_role(role.name)
         if matched is None:
             continue
         if wanted_lower and matched == wanted_lower and role not in member.roles:
@@ -7559,12 +7614,25 @@ async def apply_rank_role(guild, member, total):
         print(f"[RANK ROLE] {e}")
 
 
+def completed_deal_amount(deal):
+    """Return the confirmed dollar value, preferring the value used for MM routing."""
+    deal = deal or {}
+    routing_value = parse_amount(deal.get("usd_routing_value"))
+    if routing_value > 0:
+        return routing_value
+    price_value = parse_amount(deal.get("price"))
+    if price_value > 0:
+        return price_value
+    text_price = extract_price_from_text(deal.get("deal_text") or "")
+    return parse_amount(text_price)
+
+
 async def record_completed_deal(guild, deal, user_ids):
     """Add the deal amount to each participant's profile (once per deal)."""
     deal_key = str(deal.get("deal_id") or deal.get("ticket_channel_id") or id(deal))
+    amount = completed_deal_amount(deal)
     if deal.get("profile_recorded"):
-        return parse_amount(deal.get("price"))
-    amount = parse_amount(deal.get("price")) or parse_amount(extract_price_from_text(deal.get("deal_text") or ""))
+        return amount
     for uid in {str(u) for u in user_ids if u}:
         p = profile_for(guild.id, uid)
         p["deal_total"] = float(p.get("deal_total") or 0) + amount
