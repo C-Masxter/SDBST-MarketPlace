@@ -636,18 +636,38 @@ def parse_topic_item_price(topic):
 
 
 def extract_price_from_text(text):
-    """Find something like $105 / 105$ / 105 usd inside free text."""
+    """Find dollar deal amounts inside text:
+    1) Explicit currency like $15, 15$, 15 usd, $105.00
+    2) If no currency sign is present, but exactly ONE number exists (e.g. 'vanilla katana for 30'),
+       treat that single number as the USD deal amount.
+    3) If 2+ numbers exist without currency (e.g. '2000 Robux for $15'), prefer any marked with $ / usd."""
     if not text:
         return None
-    match = re.search(r"\$\s?(\d[\d,]*(?:\.\d+)?)", str(text))
+    s = str(text)
+    # Strip Discord mentions (<@...>, <#...>, <@&...>) and snowflakes so user/channel IDs aren't parsed as amounts
+    cleaned = re.sub(r"<[@#][!&]?\d+>", "", s)
+    cleaned = re.sub(r"\b\d{17,20}\b", "", cleaned)
+
+    # 1. Prefer explicit currency: $15, 15$, 15 usd, 15 dollars, etc.
+    match = re.search(r"\$\s*(\d[\d,]*(?:\.\d+)?)", cleaned)
     if not match:
-        match = re.search(r"(\d[\d,]*(?:\.\d+)?)\s?(?:\$|usd|dollars?)\b", str(text), flags=re.IGNORECASE)
-    if not match:
-        return None
-    try:
-        return money(float(match.group(1).replace(",", "")))
-    except (TypeError, ValueError):
-        return f"${match.group(1)}"
+        match = re.search(r"(\d[\d,]*(?:\.\d+)?)\s*(?:\$|usd|dollars?)\b", cleaned, flags=re.IGNORECASE)
+    if match:
+        try:
+            return money(float(match.group(1).replace(",", "")))
+        except (TypeError, ValueError):
+            return f"${match.group(1)}"
+
+    # 2. If no currency symbol, check if there is only ONE number in the text
+    # e.g. "vanilla katana for 30" -> 30 USD
+    numbers = re.findall(r"(?<!\w)(\d[\d,]*(?:\.\d+)?)(?!\w)", cleaned)
+    if len(numbers) == 1:
+        try:
+            return money(float(numbers[0].replace(",", "")))
+        except (TypeError, ValueError):
+            return f"${numbers[0]}"
+
+    return None
 
 
 def parse_routing_amount(text):
@@ -5952,7 +5972,12 @@ async def finish_mm_intake(channel, deal_id, deal):
     deal["seller_id"] = seller_id
     deal["roles"] = {buyer_id: "buyer", seller_id: "seller"}
     deal["item"] = deal_text
-    deal["price"] = deal.get("price") or extract_price_from_text(deal_text)
+    price_found = deal.get("price") or extract_price_from_text(deal_text)
+    deal["price"] = price_found
+    if not deal.get("usd_routing_value"):
+        routing_val = parse_routing_amount(deal_text)
+        if routing_val > 0:
+            deal["usd_routing_value"] = routing_val
     deal["participants"] = [creator_id, partner_id]
     deal["state"] = "mm_available"
     deal["intake"] = {"step": "done"}
@@ -7624,7 +7649,9 @@ def completed_deal_amount(deal):
     if price_value > 0:
         return price_value
     text_price = extract_price_from_text(deal.get("deal_text") or "")
-    return parse_amount(text_price)
+    if text_price:
+        return parse_amount(text_price)
+    return 0.0
 
 
 async def record_completed_deal(guild, deal, user_ids):
@@ -7719,14 +7746,43 @@ async def send_rate_message(channel, guild, buyer_id, seller_id, amount):
 
 # ---------------- /profile and /vouchrank ----------------
 
+def underline_numbers_in_text(text: str) -> str:
+    """Underline any numbers and monetary values in text, avoiding double-underlines."""
+    if not text:
+        return str(text or "")
+    return re.sub(r"(?<!__)(?<!\w)(\$?\d[\d,]*(?:\.\d+)?%?)(?!\w)(?!__)", r"__\1__", str(text))
+
+
+def rank_ansi_block(rank_name: str, full_label: str) -> str:
+    """Render the rank label inside a Discord ANSI codeblock to give it vivid color."""
+    lbl = full_label or "Unranked"
+    code = "37"  # Default white
+    rn = (rank_name or "").lower()
+    if "gold" in rn:
+        code = "33"      # Bright Yellow / Gold
+    elif "diamond" in rn:
+        code = "36"      # Cyan
+    elif "amethyst" in rn:
+        code = "35"      # Magenta / Purple
+    elif "whale" in rn:
+        code = "34"      # Blue
+    elif "bronze" in rn:
+        code = "31"      # Red / Bronze
+    elif "silver" in rn:
+        code = "37"      # White / Silver
+    elif "client" in rn:
+        code = "32"      # Green
+    return f"```ansi\n\u001b[1;{code}m★ {lbl}\u001b[0m\n```"
+
+
 def _make_progress_bar(current: float, prev_thresh: float, next_thresh: float, length: int = 10) -> str:
-    """Build a clean unicode progress bar."""
+    """Build a clean unicode progress bar with underlined percentage."""
     if next_thresh <= prev_thresh:
-        return "`" + "▰" * length + "` 100%"
+        return "`" + "▰" * length + "` **__100%__**"
     pct = max(0.0, min(1.0, (current - prev_thresh) / (next_thresh - prev_thresh)))
     filled = int(round(pct * length))
     bar = "▰" * filled + "▱" * (length - filled)
-    return f"`{bar}` **{int(pct * 100)}%**"
+    return f"`{bar}` **__{int(pct * 100)}%__**"
 
 
 @bot.tree.command(name="profile", description="Show a member's trading profile.")
@@ -7753,7 +7809,7 @@ async def profile_cmd(interaction: discord.Interaction, member: Optional[discord
     if ratings:
         avg_rating = sum(ratings) / len(ratings)
         r_suffix = "s" if len(ratings) != 1 else ""
-        rate_display = f"{avg_rating:.1f}/5.0 ({len(ratings)} review{r_suffix})"
+        rate_display = f"__{avg_rating:.1f}__/__5.0__ (__{len(ratings)}__ review{r_suffix})"
     else:
         rate_display = "No ratings yet"
 
@@ -7779,15 +7835,23 @@ async def profile_cmd(interaction: discord.Interaction, member: Optional[discord
         if next_t == 0 and RANK_TIERS:
             next_t = RANK_TIERS[0][0]
         bar_str = _make_progress_bar(total, prev_t, next_t)
-        next_role_str = rank_label(interaction.guild, next_rank)
-        progress_text = f"{bar_str}\n↳ Needs **{fmt_money(next_needed)}** more for {next_role_str}"
+        next_role_str = underline_numbers_in_text(rank_label(interaction.guild, next_rank))
+        progress_text = f"{bar_str}\n↳ Needs **__{fmt_money(next_needed)}__** more for {next_role_str}"
     else:
         progress_text = "🏆 **Whale Client — Maximum Tier Achieved** 🐋"
 
-    # Dynamic color matching member's top role, falling back to Gold
-    embed_color = member.color if member.color != discord.Color.default() else discord.Color.gold()
+    # Match rank role color if available, then member top role color, falling back to Gold
+    rank_role = find_rank_role_by_name(interaction.guild, current_rank) if current_rank else None
+    if rank_role and getattr(rank_role.color, "value", 0) != 0:
+        embed_color = rank_role.color
+    elif member.color != discord.Color.default():
+        embed_color = member.color
+    else:
+        embed_color = discord.Color.gold()
+
     guild_label = interaction.guild.name if interaction.guild and interaction.guild.id != MAIN_GUILD_ID and "sniper" not in interaction.guild.name.lower() else "SNIPER DUELS Buy Sell & Trade"
 
+    # User ID is deliberately NOT underlined per user request
     embed = discord.Embed(
         color=embed_color,
         description=f"👤 **Trader Card** • {member.mention}\n`ID: {member.id}`\n",
@@ -7795,23 +7859,29 @@ async def profile_cmd(interaction: discord.Interaction, member: Optional[discord
     embed.set_author(name=f"{member.display_name}", icon_url=member.display_avatar.url)
     embed.set_thumbnail(url=member.display_avatar.url)
 
-    # 1. Deal History
+    # 1. Deal History (numbers underlined)
     deal_lines = [
-        f"• **Volume:** **{fmt_money(total)}**",
-        f"• **Completed:** **{count:,}** deal{'s' if count != 1 else ''}",
+        f"• **Volume:** **__{fmt_money(total)}__**",
+        f"• **Completed:** **__{count:,}__** deal{'s' if count != 1 else ''}",
     ]
     embed.add_field(name="💼 Deal Statistics", value="\n".join(deal_lines), inline=True)
 
-    # 2. Vouches & Reputation
-    vouch_lines = [f"• **All-Time Vouches:** **{vouches:,}**"]
+    # 2. Vouches & Reputation (numbers underlined)
+    vouch_lines = [f"• **All-Time Vouches:** **__{vouches:,}__**"]
     # Only show recent window when it differs from total and has vouches, avoiding duplicate numbers
     if vouches > recent_vouches and recent_vouches > 0:
-        vouch_lines.append(f"• **Recent (Last 2k):** **{recent_vouches:,}**")
+        vouch_lines.append(f"• **Recent (Last __2k__):** **__{recent_vouches:,}__**")
     vouch_lines.append(f"• **Rating:** ⭐ **{rate_display}**")
     embed.add_field(name="⭐ Reputation", value="\n".join(vouch_lines), inline=True)
 
-    # 3. Rank & Progress
-    embed.add_field(name=f"🎖️ Trader Rank • {rank_text}", value=progress_text, inline=False)
+    # 3. Rank & Progress (ANSI colored text box + underlined rank label)
+    ansi_badge = rank_ansi_block(current_rank, rank_text)
+    underlined_rank_label = underline_numbers_in_text(rank_text)
+    embed.add_field(
+        name=f"🎖️ Trader Rank • {underlined_rank_label}",
+        value=f"{ansi_badge}{progress_text}",
+        inline=False,
+    )
 
     embed.set_footer(
         text=f"Verified Stats • {guild_label}",
@@ -8061,42 +8131,70 @@ def _vouch_ranking(guild_id):
 
 
 async def sync_vouch_top_roles(guild):
-    """Ultra Trusted for leaderboard places 1-15, Trusted for places 16-35."""
+    """Ultra Trusted for leaderboard places 1-15, Trusted for places 16-35.
+    Strictly separates roles so no member can have both roles at the same time,
+    and cleanly auto-promotes/demotes on every sync."""
     if guild is None:
         return
-    roles = {name: find_role_by_name(guild, name) for _, name in VOUCH_TOP_ROLES}
-    if not any(roles.values()):
+    ultra_role = find_role_by_name(guild, "Ultra Trusted")
+    trusted_role = find_role_by_name(guild, "Trusted")
+    all_managed_roles = [r for r in (ultra_role, trusted_role) if r is not None]
+    if not all_managed_roles:
         return
-    wanted = {}
-    for position, (uid, _) in enumerate(_vouch_ranking(guild.id), start=1):
-        for size, role_name in VOUCH_TOP_ROLES:
-            if position <= size:
-                wanted[uid] = role_name
-                break
-    for role_name, role in roles.items():
-        if role is None:
+
+    rankings = _vouch_ranking(guild.id)
+    target_roles = {}
+    for position, (uid, vouches) in enumerate(rankings, start=1):
+        if vouches <= 0:
             continue
-        keep = {uid for uid, name in wanted.items() if name == role_name}
-        for member in list(role.members):
-            if str(member.id) not in keep:
-                try:
-                    await member.remove_roles(role, reason="Vouch leaderboard update")
-                    print(f"[VOUCH ROLES] Removed {role.name} from {member.display_name}")
-                except discord.HTTPException as e:
-                    print(f"[VOUCH ROLE REMOVE] {e}")
-        for uid in keep:
+        if position <= 15 and ultra_role:
+            target_roles[str(uid)] = ultra_role
+        elif position <= VOUCH_LEADERBOARD_SIZE and trusted_role:
+            target_roles[str(uid)] = trusted_role
+
+    candidate_uids = set(target_roles.keys())
+    for r in all_managed_roles:
+        for m in list(r.members):
+            candidate_uids.add(str(m.id))
+
+    guild_profiles = _profiles.get("guilds", {}).get(str(guild.id), {})
+    for uid in guild_profiles.keys():
+        candidate_uids.add(str(uid))
+
+    for uid in candidate_uids:
+        try:
             member = guild.get_member(int(uid))
             if member is None:
                 try:
                     member = await guild.fetch_member(int(uid))
-                except discord.HTTPException:
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                     continue
-            if member and role not in member.roles:
+
+            target = target_roles.get(str(uid))
+            current_roles = [r for r in all_managed_roles if r in member.roles]
+
+            # Enforce mutual exclusivity: remove any managed role that isn't their current target
+            to_remove = [r for r in current_roles if r != target]
+            to_add = [target] if target and target not in member.roles else []
+
+            if to_remove:
                 try:
-                    await member.add_roles(role, reason="Vouch leaderboard update")
-                    print(f"[VOUCH ROLES] Added {role.name} to {member.display_name}")
+                    await member.remove_roles(*to_remove, reason="Vouch role demote / separation")
+                    print(f"[VOUCH ROLES] Removed {[r.name for r in to_remove]} from {member.display_name}")
+                except discord.HTTPException as e:
+                    print(f"[VOUCH ROLE REMOVE] {e}")
+
+            if to_add:
+                try:
+                    await member.add_roles(*to_add, reason="Vouch role promote / update")
+                    print(f"[VOUCH ROLES] Added {[r.name for r in to_add]} to {member.display_name}")
                 except discord.HTTPException as e:
                     print(f"[VOUCH ROLE ADD] {e}")
+
+            if to_remove or to_add:
+                await asyncio.sleep(0.15)
+        except Exception as e:
+            print(f"[VOUCH SYNC MEMBER {uid}] {e}")
 
 
 async def vouch_scan_loop():
