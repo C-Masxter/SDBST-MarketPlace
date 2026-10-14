@@ -5036,10 +5036,13 @@ async def vouch_ticket(interaction: discord.Interaction):
     deal_amount = completed_deal_amount(deal)
     amount_display = fmt_money(deal_amount) if deal_amount > 0 else "not available"
     try:
-        deal_amount = await record_completed_deal(interaction.guild, deal, [buyer_id, seller_id])
+        deal_participants = [buyer_id, seller_id]
+        if mm_id and mm_id not in deal_participants:
+            deal_participants.append(mm_id)
+        deal_amount = await record_completed_deal(interaction.guild, deal, deal_participants)
         amount_display = fmt_money(deal_amount) if deal_amount > 0 else "not available"
         save_mm_deals(_mm_deals)
-        await send_rate_message(interaction.channel, interaction.guild, buyer_id, seller_id, deal_amount)
+        await send_rate_message(interaction.channel, interaction.guild, buyer_id, seller_id, deal_amount, mm_id=mm_id)
     except Exception as e:
         print(f"[PROFILE/RATE] {e}")
     await interaction.followup.send(
@@ -5398,7 +5401,7 @@ async def route_mm_for_deal(interaction, deal_id, tier):
         try:
             role = interaction.guild.get_role(int(raw_id))
             if role:
-                await interaction.channel.set_permissions(role, view_channel=True, send_messages=False, read_message_history=True)
+                await interaction.channel.set_permissions(role, view_channel=True, send_messages=True, read_message_history=True)
                 invited_roles.append(role)
         except (TypeError, ValueError, discord.HTTPException):
             continue
@@ -6160,15 +6163,22 @@ async def mm(interaction: discord.Interaction):
     }
 
     tier_roles = []
-    tier_key = f"mm_tier_roles_{mm_tier}" if mm_tier else None
-    for raw_id in str(config.get(tier_key) or "").split(",") if tier_key else []:
-        try:
-            role = interaction.guild.get_role(int(raw_id.strip()))
-            if role:
-                tier_roles.append(role)
-                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True)
-        except (TypeError, ValueError):
-            continue
+    tier_keys = [f"mm_tier_roles_{mm_tier}"] if mm_tier else [
+        "mm_tier_roles_below_100",
+        "mm_tier_roles_100_200",
+        "mm_tier_roles_200_500",
+        "mm_tier_roles_500_1000",
+        "mm_tier_roles_above_1000",
+    ]
+    for key in tier_keys:
+        for raw_id in str(config.get(key) or "").split(","):
+            try:
+                role = interaction.guild.get_role(int(raw_id.strip()))
+                if role and role not in tier_roles:
+                    tier_roles.append(role)
+                    overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+            except (TypeError, ValueError):
+                continue
 
     try:
         ticket_channel = await interaction.guild.create_text_channel(
@@ -6659,7 +6669,7 @@ async def on_guild_channel_create(channel):
     # post immediately instead of waiting on one API call per role.
     async def _grant_role_access(role):
         try:
-            await channel.set_permissions(role, view_channel=True, send_messages=False, read_message_history=True)
+            await channel.set_permissions(role, view_channel=True, send_messages=True, read_message_history=True)
         except Exception as e:
             print(f"[MM AUTODETECT ROLE PERMS] {e}")
 
@@ -7450,6 +7460,7 @@ if not isinstance(_stockers, dict):
     _stockers = {}
 _profiles.setdefault("guilds", {})
 _profiles.setdefault("rate_requests", {})
+_profiles.setdefault("rate_mm_requests", {})
 _stockers.setdefault("channels", {})
 _stockers.setdefault("negotiations", {})
 
@@ -7725,7 +7736,55 @@ class RateView(discord.ui.View):
             self.add_item(RateButton(stars))
 
 
-async def send_rate_message(channel, guild, buyer_id, seller_id, amount):
+class RateMMButton(discord.ui.Button):
+    def __init__(self, stars):
+        super().__init__(
+            label=str(stars),
+            emoji=RATE_EMOJIS[stars],
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"sdbst:ratemm:{stars}",
+        )
+        self.stars = stars
+
+    async def callback(self, interaction: discord.Interaction):
+        req = _profiles.get("rate_mm_requests", {}).get(str(interaction.message.id))
+        if not req:
+            await interaction.response.send_message("❌ This middleman rating is no longer active.", ephemeral=True)
+            return
+        uid = str(interaction.user.id)
+        raters = [str(r) for r in req.get("raters", [])]
+        mm_id = str(req.get("mm_id") or "")
+        if uid == mm_id:
+            await interaction.response.send_message("❌ You cannot rate yourself as the middleman.", ephemeral=True)
+            return
+        if uid not in raters:
+            await interaction.response.send_message("❌ Only the buyer and seller of this deal can rate the middleman.", ephemeral=True)
+            return
+        if uid in req.get("rated", []):
+            await interaction.response.send_message("✅ You already rated the middleman for this deal.", ephemeral=True)
+            return
+        p = profile_for(req["guild_id"], mm_id)
+        p.setdefault("ratings", []).append(self.stars)
+        req.setdefault("rated", []).append(uid)
+        if len(req["rated"]) >= len(raters):
+            _profiles.get("rate_mm_requests", {}).pop(str(interaction.message.id), None)
+        save_profiles()
+        avg = sum(p["ratings"]) / len(p["ratings"])
+        await interaction.response.send_message(
+            f"✅ You rated middleman <@{mm_id}> **{self.stars}/5**. Their average is now **{avg:.1f}**.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+class RateMMView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        for stars in range(1, 6):
+            self.add_item(RateMMButton(stars))
+
+
+async def send_rate_message(channel, guild, buyer_id, seller_id, amount, mm_id=None):
     embed = discord.Embed(
         title="⭐ Rate the other trader",
         description=(
@@ -7741,6 +7800,26 @@ async def send_rate_message(channel, guild, buyer_id, seller_id, amount):
         "pair": {str(buyer_id): str(seller_id), str(seller_id): str(buyer_id)},
         "rated": [],
     }
+
+    if mm_id and str(mm_id) not in (str(buyer_id), str(seller_id)):
+        mm_embed = discord.Embed(
+            title="⭐ Rate Middleman Experience",
+            description=(
+                f"Deal completed: **{fmt_money(amount)}**\n"
+                f"Middleman: <@{mm_id}>\n\n"
+                f"<@{buyer_id}> and <@{seller_id}>, rate your experience with <@{mm_id}>.\n"
+                f"Tap a button from **1** (bad) to **5** (excellent)."
+            ),
+            color=MM_LIGHT_BLUE,
+        )
+        mm_msg = await channel.send(embed=mm_embed, view=RateMMView())
+        _profiles.setdefault("rate_mm_requests", {})[str(mm_msg.id)] = {
+            "guild_id": str(guild.id),
+            "mm_id": str(mm_id),
+            "raters": [str(buyer_id), str(seller_id)],
+            "rated": [],
+        }
+
     save_profiles()
 
 
@@ -7836,7 +7915,7 @@ async def profile_cmd(interaction: discord.Interaction, member: Optional[discord
             next_t = RANK_TIERS[0][0]
         bar_str = _make_progress_bar(total, prev_t, next_t)
         next_role_str = underline_numbers_in_text(rank_label(interaction.guild, next_rank))
-        progress_text = f"{bar_str}\n↳ Needs **__{fmt_money(next_needed)}__** more for {next_role_str}"
+        progress_text = f"{bar_str}\n**↳ Needs __{fmt_money(next_needed)}__ more for {next_role_str}**"
     else:
         progress_text = "🏆 **Whale Client — Maximum Tier Achieved** 🐋"
 
@@ -8512,6 +8591,7 @@ async def stocker_cleanup_loop():
 
 def register_extra_views(client):
     client.add_view(RateView())
+    client.add_view(RateMMView())
     client.add_view(StockerStickyView())
     client.add_view(StockerNegotiationView())
     client.loop.create_task(stocker_cleanup_loop())
