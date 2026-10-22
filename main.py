@@ -7971,7 +7971,7 @@ async def profile_cmd(interaction: discord.Interaction, member: Optional[discord
     await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 
-@bot.tree.command(name="vouchrank", description="Top 35 members with the most vouches in this server.")
+@bot.tree.command(name="vouchrank", description="Top 30 members with the most vouches in this server.")
 async def vouchrank_cmd(interaction: discord.Interaction):
     if interaction.guild is None:
         await safe_error(interaction, "❌ Use this command in a server.")
@@ -8053,11 +8053,12 @@ _vouch_scanned_guilds = set()
 RECENT_VOUCH_WINDOW = 2000
 _vouch_recent = _profiles.setdefault("vouch_recent", {})
 
-# Vouch leaderboard roles: top 15 get Ultra Trusted, places 16-35 get Trusted.
-VOUCH_LEADERBOARD_SIZE = 35
+# Vouch leaderboard shows the top 30; only the top 20 receive roles.
+# Places 1-10 get Ultra Trusted, and places 11-20 get Trusted.
+VOUCH_LEADERBOARD_SIZE = 30
 VOUCH_TOP_ROLES = (
-    (15, "Ultra Trusted"),
-    (VOUCH_LEADERBOARD_SIZE, "Trusted"),
+    (10, "Ultra Trusted"),
+    (20, "Trusted"),
 )
 
 # Automatic re-scan of the vouches channel. 60 * 60 = hourly.
@@ -8210,7 +8211,8 @@ def _vouch_ranking(guild_id):
 
 
 async def sync_vouch_top_roles(guild):
-    """Ultra Trusted for leaderboard places 1-15, Trusted for places 16-35.
+    """Ultra Trusted for places 1-10, Trusted for places 11-20.
+    The leaderboard still shows the top 30, but only its top 20 receive roles.
     Strictly separates roles so no member can have both roles at the same time,
     and cleanly auto-promotes/demotes on every sync."""
     if guild is None:
@@ -8226,9 +8228,9 @@ async def sync_vouch_top_roles(guild):
     for position, (uid, vouches) in enumerate(rankings, start=1):
         if vouches <= 0:
             continue
-        if position <= 15 and ultra_role:
+        if position <= 10 and ultra_role:
             target_roles[str(uid)] = ultra_role
-        elif position <= VOUCH_LEADERBOARD_SIZE and trusted_role:
+        elif position <= 20 and trusted_role:
             target_roles[str(uid)] = trusted_role
 
     candidate_uids = set(target_roles.keys())
