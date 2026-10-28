@@ -33,9 +33,7 @@ if not DISCORD_TOKEN:
         "DISCORD_TOKEN is missing from .env"
     )
 
-# The website backend is OPTIONAL now. If it's missing, down, or
-# rejecting requests, the bot saves everything locally in
-# backend_store.json and keeps working.
+#api sections ;)
 MARKETPLACE_API_URL = (MARKETPLACE_API_URL or "").strip().rstrip("/")
 MARKETPLACE_API_KEY = (MARKETPLACE_API_KEY or "").strip()
 
@@ -135,8 +133,8 @@ class MarketplaceAPI:
         if not self.client.is_closed:
             await self.client.aclose()
 
-    # ---------------- remote helper ----------------
-
+#helper
+    
     async def _remote(self, method, path, allow_404=False, **kwargs):
         if not self.enabled:
             raise RemoteUnavailable("backend disabled")
@@ -169,7 +167,7 @@ class MarketplaceAPI:
     def _is_local(record_id):
         return str(record_id or "").startswith("local-")
 
-    # ---------------- health ----------------
+    # health
 
     async def health(self):
         try:
@@ -182,7 +180,7 @@ class MarketplaceAPI:
             return {"status": "ok", "mode": "local", "remote_error": str(e)}
         return {"status": "ok", "mode": "remote"}
 
-    # ---------------- config ----------------
+    # sum slight config.
 
     async def get_config(self, server_id):
         sid = str(server_id)
@@ -228,7 +226,7 @@ class MarketplaceAPI:
             pass
         return dict(current)
 
-    # ---------------- generic records ----------------
+    # the records
 
     def _local_put(self, kind, record):
         self.store.data[kind][record[self._id_key(kind)]] = record
@@ -325,7 +323,7 @@ class MarketplaceAPI:
                 pass
         return merged
 
-    # ---------------- ads ----------------
+    # the main ad section
 
     async def list_ads(self, server_id, limit=100):
         ads = await self._list("ads", server_id, {"server_id": str(server_id), "limit": limit})
@@ -355,7 +353,7 @@ class MarketplaceAPI:
             lambda: self._remote("DELETE", f"/api/public/bot/ads/{ad_id}"),
         )
 
-    # ---------------- tickets ----------------
+    # tickets to handle
 
     async def list_tickets(self, server_id):
         return await self._list("tickets", server_id, {"server_id": str(server_id)})
