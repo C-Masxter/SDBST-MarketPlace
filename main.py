@@ -1,3 +1,7 @@
+# built by C-Master c:
+# sdbst-bot, for Sniper Duels Server
+# activate LoAc once done ;)
+
 import os
 import re
 from typing import Optional
