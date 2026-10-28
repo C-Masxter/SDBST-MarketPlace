@@ -1205,7 +1205,8 @@ class SDBSTBot(commands.Bot):
         intents.message_content = True
 
         super().__init__(
-            command_prefix="!",
+            command_prefix=["$", "!"],
+            case_insensitive=True,
             intents=intents,
             # Cap discord.py's in-memory message cache (default 1000).
             # Nothing in this bot reads cached messages.
@@ -7864,23 +7865,16 @@ def _make_progress_bar(current: float, prev_thresh: float, next_thresh: float, l
     return f"`{bar}` **__{int(pct * 100)}%__**"
 
 
-@bot.tree.command(name="profile", description="Show a member's trading profile.")
-@app_commands.describe(member="Member to look up (optional, defaults to you)")
-async def profile_cmd(interaction: discord.Interaction, member: Optional[discord.Member] = None):
-    if interaction.guild is None:
-        await safe_error(interaction, "❌ Use this command in a server.")
-        return
-    member = member or interaction.user
-
+async def build_profile_embed(guild: discord.Guild, member: discord.Member) -> discord.Embed:
     # Auto-scan guild if never scanned yet (background task so profile responds instantly)
-    if str(interaction.guild.id) not in _vouch_scanned_guilds:
-        _vouch_scanned_guilds.add(str(interaction.guild.id))
-        asyncio.create_task(scan_vouch_history(interaction.guild, limit=VOUCH_SCAN_LIMIT))
+    if str(guild.id) not in _vouch_scanned_guilds:
+        _vouch_scanned_guilds.add(str(guild.id))
+        asyncio.create_task(scan_vouch_history(guild, limit=VOUCH_SCAN_LIMIT))
 
-    p = profile_for(interaction.guild.id, member.id)
+    p = profile_for(guild.id, member.id)
     # Self-heal rank roles in case the bot was offline when someone crossed a tier.
     try:
-        await apply_rank_role(interaction.guild, member, float(p.get("deal_total") or 0))
+        await apply_rank_role(guild, member, float(p.get("deal_total") or 0))
     except Exception as e:
         print(f"[RANK ROLE] {e}")
 
@@ -7895,10 +7889,10 @@ async def profile_cmd(interaction: discord.Interaction, member: Optional[discord
     total = float(p.get("deal_total") or 0)
     count = int(p.get("deal_count") or 0)
     vouches = int(p.get("vouches") or 0)
-    recent_vouches = recent_vouch_counts(interaction.guild.id).get(str(member.id), 0)
+    recent_vouches = recent_vouch_counts(guild.id).get(str(member.id), 0)
 
     current_rank = rank_for_total(total)
-    rank_text = rank_label(interaction.guild, current_rank) if current_rank else "Unranked"
+    rank_text = rank_label(guild, current_rank) if current_rank else "Unranked"
     next_needed, next_rank = next_rank_for_total(total)
 
     # Progression bar to next tier
@@ -7914,13 +7908,13 @@ async def profile_cmd(interaction: discord.Interaction, member: Optional[discord
         if next_t == 0 and RANK_TIERS:
             next_t = RANK_TIERS[0][0]
         bar_str = _make_progress_bar(total, prev_t, next_t)
-        next_role_str = underline_numbers_in_text(rank_label(interaction.guild, next_rank))
+        next_role_str = underline_numbers_in_text(rank_label(guild, next_rank))
         progress_text = f"{bar_str}\n**↳ Needs __{fmt_money(next_needed)}__ more for {next_role_str}**"
     else:
         progress_text = "🏆 **Whale Client — Maximum Tier Achieved** 🐋"
 
     # Match rank role color if available, then member top role color, falling back to Gold
-    rank_role = find_rank_role_by_name(interaction.guild, current_rank) if current_rank else None
+    rank_role = find_rank_role_by_name(guild, current_rank) if current_rank else None
     if rank_role and getattr(rank_role.color, "value", 0) != 0:
         embed_color = rank_role.color
     elif member.color != discord.Color.default():
@@ -7928,7 +7922,7 @@ async def profile_cmd(interaction: discord.Interaction, member: Optional[discord
     else:
         embed_color = discord.Color.gold()
 
-    guild_label = interaction.guild.name if interaction.guild and interaction.guild.id != MAIN_GUILD_ID and "sniper" not in interaction.guild.name.lower() else "SNIPER DUELS Buy Sell & Trade"
+    guild_label = guild.name if guild and guild.id != MAIN_GUILD_ID and "sniper" not in guild.name.lower() else "SNIPER DUELS Buy Sell & Trade"
 
     # User ID is deliberately NOT underlined per user request
     embed = discord.Embed(
@@ -7964,11 +7958,66 @@ async def profile_cmd(interaction: discord.Interaction, member: Optional[discord
 
     embed.set_footer(
         text=f"Verified Stats • {guild_label}",
-        icon_url=interaction.guild.icon.url if interaction.guild.icon else None,
+        icon_url=guild.icon.url if guild.icon else None,
     )
     embed.timestamp = discord.utils.utcnow()
+    return embed
 
-    await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+@bot.tree.command(name="profile", description="Show a member's trading profile.")
+@app_commands.describe(member="Member to look up (optional, defaults to you)")
+async def profile_cmd(interaction: discord.Interaction, member: Optional[discord.Member] = None):
+    if interaction.guild is None:
+        await safe_error(interaction, "❌ Use this command in a server.")
+        return
+    member = member or interaction.user
+    embed = await build_profile_embed(interaction.guild, member)
+    await interaction.response.send_message(
+        content=member.mention,
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions(users=True),
+    )
+
+
+@bot.command(name="profile", aliases=["p"])
+async def profile_prefix_cmd(ctx: commands.Context, *, target: Optional[str] = None):
+    if ctx.guild is None:
+        await ctx.send("❌ Use this command in a server.")
+        return
+
+    member = None
+    if target:
+        mentions = [m for m in ctx.message.mentions if not bot.user or m.id != bot.user.id]
+        if mentions:
+            member = mentions[0]
+        else:
+            cleaned = target.strip()
+            try:
+                converter = commands.MemberConverter()
+                member = await converter.convert(ctx, cleaned)
+            except Exception:
+                pass
+            if member is None:
+                clean_id = re.sub(r"[<@!>]", "", cleaned)
+                if clean_id.isdigit():
+                    member = ctx.guild.get_member(int(clean_id))
+                    if not member:
+                        try:
+                            member = await ctx.guild.fetch_member(int(clean_id))
+                        except Exception:
+                            member = None
+        if member is None:
+            await ctx.send(f"❌ Could not find member `{target}`.")
+            return
+    else:
+        member = ctx.author
+
+    embed = await build_profile_embed(ctx.guild, member)
+    await ctx.send(
+        content=member.mention,
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions(users=True),
+    )
 
 
 @bot.tree.command(name="vouchrank", description="Top 30 members with the most vouches in this server.")
